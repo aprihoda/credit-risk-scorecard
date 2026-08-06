@@ -1,0 +1,3409 @@
+NOTE: PROCEDURE PRINTTO used (Total process time):
+      real time           0.00 seconds
+      user cpu time       0.00 seconds
+      system cpu time     0.00 seconds
+      memory              306.00k
+      OS Memory           19104.00k
+      Timestamp           08/06/2026 11:05:36 PM
+      Step Count                        29  Switch Count  0
+      Page Faults                       0
+      Page Reclaims                     19
+      Page Swaps                        0
+      Voluntary Context Switches        5
+      Involuntary Context Switches      0
+      Block Input Operations            0
+      Block Output Operations           8
+      
+
+71         
+72         OPTIONS NONOTES NOSTIMER NOSOURCE NOSYNTAXCHECK;
+82         
+2                                                          The SAS System                      Thursday, August  6, 2026 04:06:20 PM
+
+
+1                                                          The SAS System                      Thursday, August  6, 2026 04:06:20 PM
+
+1          OPTIONS NONOTES NOSTIMER NOSOURCE NOSYNTAXCHECK;
+NOTE: ODS statements in the SAS Studio environment may disable some output features.
+69         
+70         %MACRO Split_Train_Valid;
+71         
+72             PROC SQL;
+73                 CREATE VIEW MODEL.Train AS
+74                     SELECT * FROM MODEL.ModelBase WHERE 2000 <= OrigYear <= 2005;
+75         
+76                 CREATE VIEW MODEL.Valid AS
+77                     SELECT * FROM MODEL.ModelBase WHERE 2006 <= OrigYear <= 2007;
+78             QUIT;
+79         
+80             PROC SQL;
+81                 TITLE "Training and Validation Samples";
+82                 SELECT "Train" AS Sample LABEL="Sample",
+83                        count(*) AS Loans FORMAT=COMMA12. LABEL="Loans",
+84                        mean(DefaultFlag) AS DefRate FORMAT=PERCENT8.2 LABEL="Default rate"
+85                 FROM MODEL.Train
+86                 UNION
+87                 SELECT "Valid", count(*) FORMAT=COMMA12., mean(DefaultFlag) FORMAT=PERCENT8.2
+88                 FROM MODEL.Valid;
+89             QUIT;
+90         
+91             TITLE;
+92         
+93         %MEND Split_Train_Valid;
+94         
+95         
+96         /**************************************************************************************************/
+97         /*                                                                                                */
+98         /*   Woe_OneVariable macro builds the bin table for a single predictor                            */
+99         /*   Called by %FineClass_Woe once per variable - not run on its own                              */
+100        /*                                                                                                */
+101        /**************************************************************************************************/
+102        
+103        %MACRO Woe_OneVariable(Rank=, Raw=, Out=);
+104        
+105            %LOCAL TotGood TotBad;
+106        
+107            PROC MEANS DATA=WORK.Fine NOPRINT NWAY;
+108                CLASS &Rank;
+109                VAR DefaultFlag &Raw;
+110                OUTPUT OUT=SCORE.&Out
+111                       n(DefaultFlag)   = NLoans
+112                       sum(DefaultFlag) = NBad
+113                       min(&Raw)        = RawMin
+114                       max(&Raw)        = RawMax;
+115            RUN;
+116        
+117            PROC SQL NOPRINT;
+118                SELECT sum(NLoans - NBad), sum(NBad)
+119                  INTO :TotGood trimmed, :TotBad trimmed
+120                FROM SCORE.&Out;
+121            QUIT;
+122        
+123            DATA SCORE.&Out;
+124                SET SCORE.&Out;
+2                                                          The SAS System                      Thursday, August  6, 2026 04:06:20 PM
+
+125                NGood   = NLoans - NBad;
+126                PctGood = NGood / &TotGood;
+127                PctBad  = NBad  / &TotBad;
+128                IF NBad > 0 AND NGood > 0 THEN Woe = log(PctGood / PctBad);
+129                ELSE Woe = .;
+130                IvPart = (PctGood - PctBad) * Woe;
+131                FORMAT PctGood PctBad PERCENT8.2 Woe IvPart 8.4;
+132                DROP _TYPE_ _FREQ_;
+133            RUN;
+134        
+135            PROC PRINT DATA=SCORE.&Out NOOBS LABEL;
+136                TITLE "Fine Bins for &Raw - Weight of Evidence Should Move in One Direction";
+137                VAR &Rank RawMin RawMax NLoans NBad Woe IvPart;
+138                LABEL &Rank="Bin" RawMin="From" RawMax="To" NLoans="Loans"
+139                      NBad="Defaults" Woe="WOE" IvPart="IV contribution";
+140            RUN;
+141        
+142            PROC SQL;
+143                TITLE "Information Value for &Raw";
+144                SELECT sum(IvPart) AS IV FORMAT=8.4 LABEL="Information Value"
+145                FROM SCORE.&Out;
+146            QUIT;
+147        
+148            TITLE;
+149        
+150        %MEND Woe_OneVariable;
+151        
+152        
+153        /**************************************************************************************************/
+154        /*                                                                                                */
+155        /*   FineClass_Woe macro cuts each predictor into 20 ranked groups on the training data,          */
+156        /*   counts goods and bads per group, and computes Weight of Evidence and Information Value       */
+157        /*   WOE = ln(percent of goods / percent of bads): positive is safer than average                 */
+158        /*   IV  = sum over bins of (percent goods - percent bads) x WOE                                  */
+159        /*   Inspect each table for monotonic WOE before choosing coarse class cut points                 */
+160        /*                                                                                                */
+161        /**************************************************************************************************/
+162        
+163        %MACRO FineClass_Woe;
+164        
+165            PROC RANK DATA=MODEL.Train OUT=WORK.Fine GROUPS=20;
+166                VAR FICO LTV DTI OrigUPB NoteRate;
+167                RANKS RFico RLtv RDti RUpb RRate;
+168            RUN;
+169        
+170            %Woe_OneVariable(Rank=RFico, Raw=FICO,     Out=FicoBins);
+171            %Woe_OneVariable(Rank=RLtv,  Raw=LTV,      Out=LtvBins);
+172            %Woe_OneVariable(Rank=RDti,  Raw=DTI,      Out=DtiBins);
+173            %Woe_OneVariable(Rank=RUpb,  Raw=OrigUPB,  Out=UpbBins);
+174            %Woe_OneVariable(Rank=RRate, Raw=NoteRate, Out=RateBins);
+175        
+176        %MEND FineClass_Woe;
+177        
+178        /**************************************************************************************************/
+179        /*                                                                                                */
+180        /*   Run to here first. Read the fine bin tables and Information Values, choose the coarse        */
+181        /*   class cut points, then complete %CoarseClass_Formats below before going further              */
+182        /*                                                                                                */
+3                                                          The SAS System                      Thursday, August  6, 2026 04:06:20 PM
+
+183        /**************************************************************************************************/
+184        
+185        %Split_Train_Valid;
+NOTE: SQL view MODEL.TRAIN has been defined.
+NOTE: SQL view MODEL.VALID has been defined.
+NOTE: PROCEDURE SQL used (Total process time):
+      real time           0.03 seconds
+      user cpu time       0.01 seconds
+      system cpu time     0.00 seconds
+      memory              374.34k
+      OS Memory           19364.00k
+      Timestamp           08/06/2026 11:06:20 PM
+      Step Count                        35  Switch Count  2
+      Page Faults                       0
+      Page Reclaims                     160
+      Page Swaps                        0
+      Voluntary Context Switches        64
+      Involuntary Context Switches      0
+      Block Input Operations            0
+      Block Output Operations           528
+      
+
+NOTE: PROCEDURE SQL used (Total process time):
+      real time           3.22 seconds
+      user cpu time       2.69 seconds
+      system cpu time     0.50 seconds
+      memory              8522.21k
+      OS Memory           29096.00k
+      Timestamp           08/06/2026 11:06:23 PM
+      Step Count                        36  Switch Count  8
+      Page Faults                       0
+      Page Reclaims                     1239
+      Page Swaps                        0
+      Voluntary Context Switches        43
+      Involuntary Context Switches      10
+      Block Input Operations            0
+      Block Output Operations           8
+      
+
+186        
+187        %FineClass_Woe;
+
+NOTE: There were 16793948 observations read from the data set MODEL.MODELBASE.
+      WHERE (OrigYear>=2000 and OrigYear<=2005);
+NOTE: There were 16793948 observations read from the data set MODEL.TRAIN.
+NOTE: The data set WORK.FINE has 16793948 observations and 24 variables.
+NOTE: PROCEDURE RANK used (Total process time):
+      real time           23.09 seconds
+      user cpu time       20.20 seconds
+      system cpu time     2.75 seconds
+      memory              924866.81k
+      OS Memory           947012.00k
+      Timestamp           08/06/2026 11:06:47 PM
+      Step Count                        37  Switch Count  13
+      Page Faults                       0
+      Page Reclaims                     2314
+      Page Swaps                        0
+      Voluntary Context Switches        62
+4                                                          The SAS System                      Thursday, August  6, 2026 04:06:47 PM
+
+      Involuntary Context Switches      69
+      Block Input Operations            0
+      Block Output Operations           7355160
+      
+
+
+NOTE: There were 16793948 observations read from the data set WORK.FINE.
+NOTE: The data set SCORE.FICOBINS has 20 observations and 7 variables.
+NOTE: Compressing data set SCORE.FICOBINS increased size by 100.00 percent. 
+      Compressed is 2 pages; un-compressed would require 1 pages.
+NOTE: PROCEDURE MEANS used (Total process time):
+      real time           0.75 seconds
+      user cpu time       2.22 seconds
+      system cpu time     0.30 seconds
+      memory              9961.64k
+      OS Memory           32188.00k
+      Timestamp           08/06/2026 11:06:47 PM
+      Step Count                        38  Switch Count  1
+      Page Faults                       0
+      Page Reclaims                     2341
+      Page Swaps                        0
+      Voluntary Context Switches        4100
+      Involuntary Context Switches      8
+      Block Input Operations            0
+      Block Output Operations           520
+      
+
+NOTE: PROCEDURE SQL used (Total process time):
+      real time           0.00 seconds
+      user cpu time       0.00 seconds
+      system cpu time     0.00 seconds
+      memory              5605.65k
+      OS Memory           29608.00k
+      Timestamp           08/06/2026 11:06:47 PM
+      Step Count                        39  Switch Count  0
+      Page Faults                       0
+      Page Reclaims                     50
+      Page Swaps                        0
+      Voluntary Context Switches        11
+      Involuntary Context Switches      0
+      Block Input Operations            0
+      Block Output Operations           0
+      
+
+
+NOTE: There were 20 observations read from the data set SCORE.FICOBINS.
+NOTE: The data set SCORE.FICOBINS has 20 observations and 10 variables.
+NOTE: Compressing data set SCORE.FICOBINS increased size by 100.00 percent. 
+      Compressed is 2 pages; un-compressed would require 1 pages.
+NOTE: DATA statement used (Total process time):
+      real time           0.01 seconds
+      user cpu time       0.00 seconds
+      system cpu time     0.00 seconds
+      memory              1064.65k
+      OS Memory           24744.00k
+      Timestamp           08/06/2026 11:06:47 PM
+      Step Count                        40  Switch Count  1
+      Page Faults                       0
+5                                                          The SAS System                      Thursday, August  6, 2026 04:06:47 PM
+
+      Page Reclaims                     128
+      Page Swaps                        0
+      Voluntary Context Switches        40
+      Involuntary Context Switches      1
+      Block Input Operations            0
+      Block Output Operations           520
+      
+
+
+NOTE: There were 20 observations read from the data set SCORE.FICOBINS.
+NOTE: PROCEDURE PRINT used (Total process time):
+      real time           0.02 seconds
+      user cpu time       0.02 seconds
+      system cpu time     0.00 seconds
+      memory              738.96k
+      OS Memory           24484.00k
+      Timestamp           08/06/2026 11:06:47 PM
+      Step Count                        41  Switch Count  1
+      Page Faults                       0
+      Page Reclaims                     94
+      Page Swaps                        0
+      Voluntary Context Switches        15
+      Involuntary Context Switches      2
+      Block Input Operations            0
+      Block Output Operations           0
+      
+
+NOTE: PROCEDURE SQL used (Total process time):
+      real time           0.00 seconds
+      user cpu time       0.01 seconds
+      system cpu time     0.00 seconds
+      memory              5604.87k
+      OS Memory           29608.00k
+      Timestamp           08/06/2026 11:06:47 PM
+      Step Count                        42  Switch Count  1
+      Page Faults                       0
+      Page Reclaims                     58
+      Page Swaps                        0
+      Voluntary Context Switches        12
+      Involuntary Context Switches      0
+      Block Input Operations            0
+      Block Output Operations           0
+      
+
+
+NOTE: There were 16793948 observations read from the data set WORK.FINE.
+NOTE: The data set SCORE.LTVBINS has 18 observations and 7 variables.
+NOTE: Compressing data set SCORE.LTVBINS increased size by 100.00 percent. 
+      Compressed is 2 pages; un-compressed would require 1 pages.
+NOTE: PROCEDURE MEANS used (Total process time):
+      real time           0.71 seconds
+      user cpu time       2.11 seconds
+      system cpu time     0.39 seconds
+      memory              9938.15k
+      OS Memory           32188.00k
+      Timestamp           08/06/2026 11:06:48 PM
+      Step Count                        43  Switch Count  8
+      Page Faults                       0
+6                                                          The SAS System                      Thursday, August  6, 2026 04:06:48 PM
+
+      Page Reclaims                     2095
+      Page Swaps                        0
+      Voluntary Context Switches        3560
+      Involuntary Context Switches      6
+      Block Input Operations            0
+      Block Output Operations           520
+      
+
+NOTE: PROCEDURE SQL used (Total process time):
+      real time           0.00 seconds
+      user cpu time       0.00 seconds
+      system cpu time     0.00 seconds
+      memory              5605.65k
+      OS Memory           29608.00k
+      Timestamp           08/06/2026 11:06:48 PM
+      Step Count                        44  Switch Count  0
+      Page Faults                       0
+      Page Reclaims                     50
+      Page Swaps                        0
+      Voluntary Context Switches        10
+      Involuntary Context Switches      0
+      Block Input Operations            0
+      Block Output Operations           0
+      
+
+
+NOTE: There were 18 observations read from the data set SCORE.LTVBINS.
+NOTE: The data set SCORE.LTVBINS has 18 observations and 10 variables.
+NOTE: Compressing data set SCORE.LTVBINS increased size by 100.00 percent. 
+      Compressed is 2 pages; un-compressed would require 1 pages.
+NOTE: DATA statement used (Total process time):
+      real time           0.01 seconds
+      user cpu time       0.00 seconds
+      system cpu time     0.00 seconds
+      memory              1064.18k
+      OS Memory           24744.00k
+      Timestamp           08/06/2026 11:06:48 PM
+      Step Count                        45  Switch Count  1
+      Page Faults                       0
+      Page Reclaims                     121
+      Page Swaps                        0
+      Voluntary Context Switches        47
+      Involuntary Context Switches      0
+      Block Input Operations            0
+      Block Output Operations           520
+      
+
+
+NOTE: There were 18 observations read from the data set SCORE.LTVBINS.
+NOTE: PROCEDURE PRINT used (Total process time):
+      real time           0.02 seconds
+      user cpu time       0.02 seconds
+      system cpu time     0.00 seconds
+      memory              678.59k
+      OS Memory           24484.00k
+      Timestamp           08/06/2026 11:06:48 PM
+      Step Count                        46  Switch Count  1
+      Page Faults                       0
+7                                                          The SAS System                      Thursday, August  6, 2026 04:06:48 PM
+
+      Page Reclaims                     62
+      Page Swaps                        0
+      Voluntary Context Switches        15
+      Involuntary Context Switches      2
+      Block Input Operations            0
+      Block Output Operations           16
+      
+
+NOTE: PROCEDURE SQL used (Total process time):
+      real time           0.00 seconds
+      user cpu time       0.01 seconds
+      system cpu time     0.00 seconds
+      memory              5604.87k
+      OS Memory           29608.00k
+      Timestamp           08/06/2026 11:06:48 PM
+      Step Count                        47  Switch Count  1
+      Page Faults                       0
+      Page Reclaims                     55
+      Page Swaps                        0
+      Voluntary Context Switches        14
+      Involuntary Context Switches      0
+      Block Input Operations            0
+      Block Output Operations           0
+      
+
+
+NOTE: There were 16793948 observations read from the data set WORK.FINE.
+NOTE: The data set SCORE.DTIBINS has 20 observations and 7 variables.
+NOTE: Compressing data set SCORE.DTIBINS increased size by 100.00 percent. 
+      Compressed is 2 pages; un-compressed would require 1 pages.
+NOTE: PROCEDURE MEANS used (Total process time):
+      real time           0.73 seconds
+      user cpu time       2.17 seconds
+      system cpu time     0.32 seconds
+      memory              9937.00k
+      OS Memory           32188.00k
+      Timestamp           08/06/2026 11:06:49 PM
+      Step Count                        48  Switch Count  6
+      Page Faults                       0
+      Page Reclaims                     2076
+      Page Swaps                        0
+      Voluntary Context Switches        4119
+      Involuntary Context Switches      14
+      Block Input Operations            0
+      Block Output Operations           520
+      
+
+NOTE: PROCEDURE SQL used (Total process time):
+      real time           0.00 seconds
+      user cpu time       0.00 seconds
+      system cpu time     0.00 seconds
+      memory              5605.65k
+      OS Memory           29608.00k
+      Timestamp           08/06/2026 11:06:49 PM
+      Step Count                        49  Switch Count  0
+      Page Faults                       0
+      Page Reclaims                     50
+      Page Swaps                        0
+8                                                          The SAS System                      Thursday, August  6, 2026 04:06:49 PM
+
+      Voluntary Context Switches        11
+      Involuntary Context Switches      0
+      Block Input Operations            0
+      Block Output Operations           0
+      
+
+
+NOTE: There were 20 observations read from the data set SCORE.DTIBINS.
+NOTE: The data set SCORE.DTIBINS has 20 observations and 10 variables.
+NOTE: Compressing data set SCORE.DTIBINS increased size by 100.00 percent. 
+      Compressed is 2 pages; un-compressed would require 1 pages.
+NOTE: DATA statement used (Total process time):
+      real time           0.01 seconds
+      user cpu time       0.00 seconds
+      system cpu time     0.00 seconds
+      memory              1064.18k
+      OS Memory           24744.00k
+      Timestamp           08/06/2026 11:06:49 PM
+      Step Count                        50  Switch Count  1
+      Page Faults                       0
+      Page Reclaims                     121
+      Page Swaps                        0
+      Voluntary Context Switches        42
+      Involuntary Context Switches      0
+      Block Input Operations            0
+      Block Output Operations           520
+      
+
+
+NOTE: There were 20 observations read from the data set SCORE.DTIBINS.
+NOTE: PROCEDURE PRINT used (Total process time):
+      real time           0.02 seconds
+      user cpu time       0.02 seconds
+      system cpu time     0.00 seconds
+      memory              678.59k
+      OS Memory           24484.00k
+      Timestamp           08/06/2026 11:06:49 PM
+      Step Count                        51  Switch Count  1
+      Page Faults                       0
+      Page Reclaims                     61
+      Page Swaps                        0
+      Voluntary Context Switches        16
+      Involuntary Context Switches      1
+      Block Input Operations            0
+      Block Output Operations           16
+      
+
+NOTE: PROCEDURE SQL used (Total process time):
+      real time           0.00 seconds
+      user cpu time       0.01 seconds
+      system cpu time     0.00 seconds
+      memory              5604.87k
+      OS Memory           29608.00k
+      Timestamp           08/06/2026 11:06:49 PM
+      Step Count                        52  Switch Count  1
+      Page Faults                       0
+      Page Reclaims                     55
+      Page Swaps                        0
+9                                                          The SAS System                      Thursday, August  6, 2026 04:06:49 PM
+
+      Voluntary Context Switches        12
+      Involuntary Context Switches      0
+      Block Input Operations            0
+      Block Output Operations           0
+      
+
+
+NOTE: There were 16793948 observations read from the data set WORK.FINE.
+NOTE: The data set SCORE.UPBBINS has 20 observations and 7 variables.
+NOTE: Compressing data set SCORE.UPBBINS increased size by 100.00 percent. 
+      Compressed is 2 pages; un-compressed would require 1 pages.
+NOTE: PROCEDURE MEANS used (Total process time):
+      real time           0.74 seconds
+      user cpu time       2.19 seconds
+      system cpu time     0.31 seconds
+      memory              9936.84k
+      OS Memory           32188.00k
+      Timestamp           08/06/2026 11:06:50 PM
+      Step Count                        53  Switch Count  8
+      Page Faults                       0
+      Page Reclaims                     2091
+      Page Swaps                        0
+      Voluntary Context Switches        4135
+      Involuntary Context Switches      8
+      Block Input Operations            0
+      Block Output Operations           520
+      
+
+NOTE: PROCEDURE SQL used (Total process time):
+      real time           0.00 seconds
+      user cpu time       0.00 seconds
+      system cpu time     0.00 seconds
+      memory              5605.65k
+      OS Memory           29608.00k
+      Timestamp           08/06/2026 11:06:50 PM
+      Step Count                        54  Switch Count  0
+      Page Faults                       0
+      Page Reclaims                     50
+      Page Swaps                        0
+      Voluntary Context Switches        10
+      Involuntary Context Switches      0
+      Block Input Operations            0
+      Block Output Operations           0
+      
+
+
+NOTE: There were 20 observations read from the data set SCORE.UPBBINS.
+NOTE: The data set SCORE.UPBBINS has 20 observations and 10 variables.
+NOTE: Compressing data set SCORE.UPBBINS increased size by 100.00 percent. 
+      Compressed is 2 pages; un-compressed would require 1 pages.
+NOTE: DATA statement used (Total process time):
+      real time           0.01 seconds
+      user cpu time       0.00 seconds
+      system cpu time     0.00 seconds
+      memory              1064.65k
+      OS Memory           24744.00k
+      Timestamp           08/06/2026 11:06:50 PM
+      Step Count                        55  Switch Count  1
+10                                                         The SAS System                      Thursday, August  6, 2026 04:06:50 PM
+
+      Page Faults                       0
+      Page Reclaims                     121
+      Page Swaps                        0
+      Voluntary Context Switches        46
+      Involuntary Context Switches      0
+      Block Input Operations            0
+      Block Output Operations           520
+      
+
+
+NOTE: There were 20 observations read from the data set SCORE.UPBBINS.
+NOTE: PROCEDURE PRINT used (Total process time):
+      real time           0.02 seconds
+      user cpu time       0.02 seconds
+      system cpu time     0.00 seconds
+      memory              678.71k
+      OS Memory           24484.00k
+      Timestamp           08/06/2026 11:06:50 PM
+      Step Count                        56  Switch Count  1
+      Page Faults                       0
+      Page Reclaims                     61
+      Page Swaps                        0
+      Voluntary Context Switches        15
+      Involuntary Context Switches      2
+      Block Input Operations            0
+      Block Output Operations           16
+      
+
+NOTE: PROCEDURE SQL used (Total process time):
+      real time           0.00 seconds
+      user cpu time       0.01 seconds
+      system cpu time     0.00 seconds
+      memory              5604.87k
+      OS Memory           29608.00k
+      Timestamp           08/06/2026 11:06:50 PM
+      Step Count                        57  Switch Count  1
+      Page Faults                       0
+      Page Reclaims                     55
+      Page Swaps                        0
+      Voluntary Context Switches        13
+      Involuntary Context Switches      1
+      Block Input Operations            0
+      Block Output Operations           0
+      
+
+
+NOTE: There were 16793948 observations read from the data set WORK.FINE.
+NOTE: The data set SCORE.RATEBINS has 20 observations and 7 variables.
+NOTE: Compressing data set SCORE.RATEBINS increased size by 100.00 percent. 
+      Compressed is 2 pages; un-compressed would require 1 pages.
+NOTE: PROCEDURE MEANS used (Total process time):
+      real time           0.67 seconds
+      user cpu time       2.02 seconds
+      system cpu time     0.30 seconds
+      memory              9942.71k
+      OS Memory           32188.00k
+      Timestamp           08/06/2026 11:06:50 PM
+      Step Count                        58  Switch Count  8
+11                                                         The SAS System                      Thursday, August  6, 2026 04:06:50 PM
+
+      Page Faults                       0
+      Page Reclaims                     2074
+      Page Swaps                        0
+      Voluntary Context Switches        3985
+      Involuntary Context Switches      6
+      Block Input Operations            0
+      Block Output Operations           520
+      
+
+NOTE: PROCEDURE SQL used (Total process time):
+      real time           0.00 seconds
+      user cpu time       0.00 seconds
+      system cpu time     0.00 seconds
+      memory              5605.65k
+      OS Memory           29608.00k
+      Timestamp           08/06/2026 11:06:50 PM
+      Step Count                        59  Switch Count  0
+      Page Faults                       0
+      Page Reclaims                     50
+      Page Swaps                        0
+      Voluntary Context Switches        11
+      Involuntary Context Switches      0
+      Block Input Operations            0
+      Block Output Operations           8
+      
+
+
+NOTE: There were 20 observations read from the data set SCORE.RATEBINS.
+NOTE: The data set SCORE.RATEBINS has 20 observations and 10 variables.
+NOTE: Compressing data set SCORE.RATEBINS increased size by 100.00 percent. 
+      Compressed is 2 pages; un-compressed would require 1 pages.
+NOTE: DATA statement used (Total process time):
+      real time           0.01 seconds
+      user cpu time       0.00 seconds
+      system cpu time     0.01 seconds
+      memory              1065.84k
+      OS Memory           24744.00k
+      Timestamp           08/06/2026 11:06:50 PM
+      Step Count                        60  Switch Count  1
+      Page Faults                       0
+      Page Reclaims                     121
+      Page Swaps                        0
+      Voluntary Context Switches        43
+      Involuntary Context Switches      0
+      Block Input Operations            0
+      Block Output Operations           520
+      
+
+
+NOTE: There were 20 observations read from the data set SCORE.RATEBINS.
+NOTE: PROCEDURE PRINT used (Total process time):
+      real time           0.02 seconds
+      user cpu time       0.02 seconds
+      system cpu time     0.00 seconds
+      memory              679.53k
+      OS Memory           24484.00k
+      Timestamp           08/06/2026 11:06:50 PM
+      Step Count                        61  Switch Count  1
+12                                                         The SAS System                      Thursday, August  6, 2026 04:06:50 PM
+
+      Page Faults                       0
+      Page Reclaims                     61
+      Page Swaps                        0
+      Voluntary Context Switches        15
+      Involuntary Context Switches      2
+      Block Input Operations            0
+      Block Output Operations           0
+      
+
+NOTE: PROCEDURE SQL used (Total process time):
+      real time           0.00 seconds
+      user cpu time       0.00 seconds
+      system cpu time     0.00 seconds
+      memory              5604.87k
+      OS Memory           29608.00k
+      Timestamp           08/06/2026 11:06:50 PM
+      Step Count                        62  Switch Count  1
+      Page Faults                       0
+      Page Reclaims                     55
+      Page Swaps                        0
+      Voluntary Context Switches        17
+      Involuntary Context Switches      0
+      Block Input Operations            0
+      Block Output Operations           0
+      
+
+188        
+189        
+190        
+191        /**************************************************************************************************/
+192        /*                                                                                                */
+193        /*   CoarseClass_Formats macro holds the final bin cut points as PROC FORMAT ranges               */
+194        /*   Values computed from the fine bin tables produced by %FineClass_Woe on the 2000 to 2005      */
+195        /*   training sample, 16.8 million loans at a 1.96 percent default rate                           */
+196        /*   Every class holds at least 5 percent of the sample and Weight of Evidence moves in one       */
+197        /*   direction across all classes                                                                 */
+198        /*   Cut points come from the training data only and are never recomputed on validation           */
+199        /*                                                                                                */
+200        /**************************************************************************************************/
+201        
+202        %MACRO CoarseClass_Formats;
+203        
+204            PROC FORMAT;
+205        
+206                /*   FICO - 10 classes, IV 0.5234, WOE -0.9041 to 1.3341   */
+207                value woe_fico
+208                    low  - 619  = -0.9041
+209                    620  - 656  = -0.8237
+210                    657  - 680  = -0.5716
+211                    681  - 700  = -0.2737
+212                    701  - 718  = -0.0094
+213                    719  - 736  =  0.2604
+214                    737  - 752  =  0.5593
+215                    753  - 765  =  0.8291
+216                    766  - 779  =  1.1297
+217                    780  - high =  1.3341
+218                    other       =  0;
+219        
+13                                                         The SAS System                      Thursday, August  6, 2026 04:06:50 PM
+
+220                /*   LTV - 9 classes, IV 0.4840. LTV exactly 80 is its own class because borrowers     */
+221                /*   who put 20 percent down to avoid mortgage insurance are a distinct population     */
+222                value woe_ltv
+223                    low  - 43   =  2.0554
+224                    44   - 54   =  1.3212
+225                    55   - 62   =  0.7757
+226                    63   - 69   =  0.3166
+227                    70   - 79   = -0.0406
+228                    80   - 80   = -0.2582
+229                    81   - 89   = -0.5849
+230                    90   - 94   = -0.7353
+231                    95   - high = -0.8508
+232                    other       =  0;
+233        
+234                /*   DTI - 6 classes, IV 0.1357   */
+235                value woe_dti
+236                    low  - 19   =  0.6807
+237                    20   - 25   =  0.4392
+238                    26   - 32   =  0.1615
+239                    33   - 37   = -0.0843
+240                    38   - 44   = -0.2870
+241                    45   - high = -0.3970
+242                    other       =  0;
+243        
+244            RUN;
+245        
+246        %MEND CoarseClass_Formats;
+247        
+248        
+249        /**************************************************************************************************/
+250        /*                                                                                                */
+251        /*   Apply_Woe macro replaces each raw value with the Weight of Evidence of its bin               */
+252        /*   The same formats are applied to training and validation - validation is never re-binned      */
+253        /*                                                                                                */
+254        /**************************************************************************************************/
+255        
+256        %MACRO Apply_Woe;
+257        
+258            DATA MODEL.TrainWoe;
+259                SET MODEL.Train;
+260                WoeFico = INPUT(PUT(FICO, woe_fico.), BEST12.);
+261                WoeLtv  = INPUT(PUT(LTV,  woe_ltv.),  BEST12.);
+262                WoeDti  = INPUT(PUT(DTI,  woe_dti.),  BEST12.);
+263            RUN;
+264        
+265            DATA MODEL.ValidWoe;
+266                SET MODEL.Valid;
+267                WoeFico = INPUT(PUT(FICO, woe_fico.), BEST12.);
+268                WoeLtv  = INPUT(PUT(LTV,  woe_ltv.),  BEST12.);
+269                WoeDti  = INPUT(PUT(DTI,  woe_dti.),  BEST12.);
+270            RUN;
+271        
+272        %MEND Apply_Woe;
+273        
+274        
+275        /**************************************************************************************************/
+276        /*                                                                                                */
+277        /*   Fit_Model macro fits the logistic regression on the Weight of Evidence variables             */
+14                                                         The SAS System                      Thursday, August  6, 2026 04:06:50 PM
+
+278        /*   Models the log odds of default, so the prediction stays between 0 and 1                      */
+279        /*   OUTMODEL saves the fitted model so validation can be scored without refitting                */
+280        /*                                                                                                */
+281        /**************************************************************************************************/
+282        
+283        %MACRO Fit_Model;
+284        
+285            PROC LOGISTIC DATA=MODEL.TrainWoe OUTMODEL=MODEL.PdModel;
+286                TITLE "Model Fit - Training Sample";
+287                MODEL DefaultFlag(EVENT='1') = WoeFico WoeLtv WoeDti
+288                      / OUTROC=REPORT.RocTrain;
+289                ODS OUTPUT ParameterEstimates=MODEL.Coefficients;
+290            RUN;
+291        
+292            TITLE;
+293        
+294        %MEND Fit_Model;
+295        
+296        /**************************************************************************************************/
+297        /*                                                                                                */
+298        /*   Run to here next. Read the parameter estimates, then complete %Points_Scorecard below        */
+299        /*   before going further                                                                         */
+300        /*                                                                                                */
+301        /**************************************************************************************************/
+302        
+303        %CoarseClass_Formats;
+NOTE: Format WOE_FICO has been output.
+NOTE: Format WOE_LTV has been output.
+NOTE: Format WOE_DTI has been output.
+
+NOTE: PROCEDURE FORMAT used (Total process time):
+      real time           0.00 seconds
+      user cpu time       0.00 seconds
+      system cpu time     0.00 seconds
+      memory              155.18k
+      OS Memory           24224.00k
+      Timestamp           08/06/2026 11:06:50 PM
+      Step Count                        63  Switch Count  2
+      Page Faults                       0
+      Page Reclaims                     28
+      Page Swaps                        0
+      Voluntary Context Switches        14
+      Involuntary Context Switches      0
+      Block Input Operations            0
+      Block Output Operations           56
+      
+
+304        
+305        %Apply_Woe;
+
+NOTE: There were 16793948 observations read from the data set MODEL.MODELBASE.
+      WHERE (OrigYear>=2000 and OrigYear<=2005);
+NOTE: There were 16793948 observations read from the data set MODEL.TRAIN.
+NOTE: The data set MODEL.TRAINWOE has 16793948 observations and 22 variables.
+NOTE: Compressing data set MODEL.TRAINWOE increased size by 20.59 percent. 
+      Compressed is 13629 pages; un-compressed would require 11302 pages.
+NOTE: DATA statement used (Total process time):
+      real time           21.19 seconds
+15                                                         The SAS System                      Thursday, August  6, 2026 04:07:12 PM
+
+      user cpu time       15.83 seconds
+      system cpu time     1.39 seconds
+      memory              7165.31k
+      OS Memory           30376.00k
+      Timestamp           08/06/2026 11:07:12 PM
+      Step Count                        64  Switch Count  34
+      Page Faults                       0
+      Page Reclaims                     702
+      Page Swaps                        0
+      Voluntary Context Switches        32151
+      Involuntary Context Switches      253
+      Block Input Operations            0
+      Block Output Operations           3489568
+      
+
+
+NOTE: There were 2190651 observations read from the data set MODEL.MODELBASE.
+      WHERE (OrigYear>=2006 and OrigYear<=2007);
+NOTE: There were 2190651 observations read from the data set MODEL.VALID.
+NOTE: The data set MODEL.VALIDWOE has 2190651 observations and 22 variables.
+NOTE: Compressing data set MODEL.VALIDWOE increased size by 20.75 percent. 
+      Compressed is 1781 pages; un-compressed would require 1475 pages.
+NOTE: DATA statement used (Total process time):
+      real time           3.51 seconds
+      user cpu time       2.58 seconds
+      system cpu time     0.38 seconds
+      memory              7165.31k
+      OS Memory           30376.00k
+      Timestamp           08/06/2026 11:07:15 PM
+      Step Count                        65  Switch Count  2
+      Page Faults                       0
+      Page Reclaims                     675
+      Page Swaps                        0
+      Voluntary Context Switches        5631
+      Involuntary Context Switches      11
+      Block Input Operations            0
+      Block Output Operations           455944
+      
+
+306        
+307        %Fit_Model;
+NOTE: Due to a large number of observations, the BINWIDTH= value is set to 0.002.
+NOTE: PROC LOGISTIC is modeling the probability that DefaultFlag=1.
+NOTE: Convergence criterion (GCONV=1E-8) satisfied.
+NOTE: The data set MODEL.COEFFICIENTS has 4 observations and 7 variables.
+NOTE: Compressing data set MODEL.COEFFICIENTS increased size by 100.00 percent. 
+      Compressed is 2 pages; un-compressed would require 1 pages.
+NOTE: There were 16793948 observations read from the data set MODEL.TRAINWOE.
+NOTE: The data set MODEL.PDMODEL has 28 observations and 6 variables.
+NOTE: Compressing data set MODEL.PDMODEL increased size by 100.00 percent. 
+      Compressed is 2 pages; un-compressed would require 1 pages.
+NOTE: The data set REPORT.ROCTRAIN has 701 observations and 7 variables.
+NOTE: Compressing data set REPORT.ROCTRAIN increased size by 100.00 percent. 
+      Compressed is 2 pages; un-compressed would require 1 pages.
+NOTE: PROCEDURE LOGISTIC used (Total process time):
+      real time           1:01.06
+      user cpu time       51.99 seconds
+      system cpu time     5.22 seconds
+16                                                         The SAS System                      Thursday, August  6, 2026 04:08:16 PM
+
+      memory              1721410.03k
+      OS Memory           1746928.00k
+      Timestamp           08/06/2026 11:08:16 PM
+      Step Count                        66  Switch Count  86
+      Page Faults                       0
+      Page Reclaims                     466409
+      Page Swaps                        0
+      Voluntary Context Switches        18975
+      Involuntary Context Switches      507
+      Block Input Operations            0
+      Block Output Operations           5775528
+      
+
+308        
+309        
+310        /**************************************************************************************************/
+311        /*                                                                                                */
+312        /*   Points_Scorecard macro converts the model coefficients into scorecard points                 */
+313        /*   Base 600 points at 50 to 1 odds, 20 points to double the odds                                */
+314        /*   factor = PDO / ln(2), offset = base - factor x ln(base odds)                                 */
+315        /*   Points per class = -(coefficient x WOE + intercept / n) x factor + offset / n                */
+316        /*   Coefficients come from MODEL.Coefficients, so the table rebuilds itself whenever the         */
+317        /*   model is refitted - nothing is typed in by hand                                              */
+318        /*                                                                                                */
+319        /**************************************************************************************************/
+320        
+321        %MACRO Points_Scorecard(Pdo=20, BasePoints=600, BaseOdds=50, NVars=3);
+322        
+323            %LOCAL Factor Offset;
+324            %LET Factor = %SYSEVALF(&Pdo / 0.6931472);
+325            %LET Offset = %SYSEVALF(&BasePoints - &Factor * %SYSFUNC(LOG(&BaseOdds)));
+326        
+327            /*   The coarse classes and their Weight of Evidence, as applied by %CoarseClass_Formats   */
+328            /*   Assignment statements are used because a macro cannot generate DATALINES              */
+329            DATA WORK._Classes;
+330                LENGTH Characteristic $14 Bin $14 Variable $8 Woe 8 SortKey 3;
+331        
+332                /*   SortKey orders the printed table by predictive strength, strongest first   */
+333        
+334                Characteristic="Credit score"; Bin="below 620"; Woe=-0.9041; Variable="WoeFico"; SortKey=1; OUTPUT;
+335                Characteristic="Credit score"; Bin="620 to 656"; Woe=-0.8237; Variable="WoeFico"; SortKey=1; OUTPUT;
+336                Characteristic="Credit score"; Bin="657 to 680"; Woe=-0.5716; Variable="WoeFico"; SortKey=1; OUTPUT;
+337                Characteristic="Credit score"; Bin="681 to 700"; Woe=-0.2737; Variable="WoeFico"; SortKey=1; OUTPUT;
+338                Characteristic="Credit score"; Bin="701 to 718"; Woe=-0.0094; Variable="WoeFico"; SortKey=1; OUTPUT;
+339                Characteristic="Credit score"; Bin="719 to 736"; Woe= 0.2604; Variable="WoeFico"; SortKey=1; OUTPUT;
+340                Characteristic="Credit score"; Bin="737 to 752"; Woe= 0.5593; Variable="WoeFico"; SortKey=1; OUTPUT;
+341                Characteristic="Credit score"; Bin="753 to 765"; Woe= 0.8291; Variable="WoeFico"; SortKey=1; OUTPUT;
+342                Characteristic="Credit score"; Bin="766 to 779"; Woe= 1.1297; Variable="WoeFico"; SortKey=1; OUTPUT;
+343                Characteristic="Credit score"; Bin="780 and above"; Woe= 1.3341; Variable="WoeFico"; SortKey=1; OUTPUT;
+344                Characteristic="LTV"; Bin="43 and below"; Woe= 2.0554; Variable="WoeLtv"; SortKey=2; OUTPUT;
+345                Characteristic="LTV"; Bin="44 to 54"; Woe= 1.3212; Variable="WoeLtv"; SortKey=2; OUTPUT;
+346                Characteristic="LTV"; Bin="55 to 62"; Woe= 0.7757; Variable="WoeLtv"; SortKey=2; OUTPUT;
+347                Characteristic="LTV"; Bin="63 to 69"; Woe= 0.3166; Variable="WoeLtv"; SortKey=2; OUTPUT;
+348                Characteristic="LTV"; Bin="70 to 79"; Woe=-0.0406; Variable="WoeLtv"; SortKey=2; OUTPUT;
+349                Characteristic="LTV"; Bin="exactly 80"; Woe=-0.2582; Variable="WoeLtv"; SortKey=2; OUTPUT;
+350                Characteristic="LTV"; Bin="81 to 89"; Woe=-0.5849; Variable="WoeLtv"; SortKey=2; OUTPUT;
+351                Characteristic="LTV"; Bin="90 to 94"; Woe=-0.7353; Variable="WoeLtv"; SortKey=2; OUTPUT;
+352                Characteristic="LTV"; Bin="95 and above"; Woe=-0.8508; Variable="WoeLtv"; SortKey=2; OUTPUT;
+17                                                         The SAS System                      Thursday, August  6, 2026 04:08:16 PM
+
+353                Characteristic="DTI"; Bin="19 and below"; Woe= 0.6807; Variable="WoeDti"; SortKey=3; OUTPUT;
+354                Characteristic="DTI"; Bin="20 to 25"; Woe= 0.4392; Variable="WoeDti"; SortKey=3; OUTPUT;
+355                Characteristic="DTI"; Bin="26 to 32"; Woe= 0.1615; Variable="WoeDti"; SortKey=3; OUTPUT;
+356                Characteristic="DTI"; Bin="33 to 37"; Woe=-0.0843; Variable="WoeDti"; SortKey=3; OUTPUT;
+357                Characteristic="DTI"; Bin="38 to 44"; Woe=-0.2870; Variable="WoeDti"; SortKey=3; OUTPUT;
+358                Characteristic="DTI"; Bin="45 and above"; Woe=-0.3970; Variable="WoeDti"; SortKey=3; OUTPUT;
+359            RUN;
+360        
+361        
+362            /*   Intercept and slope coefficients from the fitted model   */
+363            PROC SQL NOPRINT;
+364                SELECT Estimate INTO :Intercept trimmed
+365                FROM MODEL.Coefficients
+366                WHERE Variable = "Intercept";
+367            QUIT;
+368        
+369            PROC SQL;
+370                CREATE TABLE SCORE.Points AS
+371                SELECT c.Characteristic          LABEL="Characteristic",
+372                       c.Bin                     LABEL="Class",
+373                       c.Woe                     FORMAT=8.4 LABEL="WOE",
+374                       b.Estimate                FORMAT=8.4 LABEL="Coefficient",
+375                       round(-(b.Estimate * c.Woe + &Intercept / &NVars) * &Factor
+376                             + &Offset / &NVars)  AS Points FORMAT=6. LABEL="Points",
+377                       c.SortKey
+378                FROM WORK._Classes c
+379                INNER JOIN MODEL.Coefficients b ON c.Variable = b.Variable
+380                ORDER BY c.SortKey, c.Woe DESC;
+381            QUIT;
+382        
+383            /*   Coefficient is kept in the table but not printed - it repeats down each block   */
+384            PROC PRINT DATA=SCORE.Points NOOBS LABEL;
+385                TITLE "Credit Risk Scorecard - Points by Characteristic and Class";
+386                TITLE2 "Base &BasePoints points at &BaseOdds to 1 odds, &Pdo points to double the odds";
+387                VAR Characteristic Bin Woe Points;
+388            RUN;
+389        
+390            TITLE;
+391        
+392        %MEND Points_Scorecard;
+393        
+394        
+395        
+396        /**************************************************************************************************/
+397        /*                                                                                                */
+398        /*   Score_Validation macro scores the out-of-time sample with the fitted model and               */
+399        /*   measures discrimination                                                                      */
+400        /*   KS   - widest gap between cumulative bads captured and cumulative goods captured             */
+401        /*   AUC  - probability a random defaulter scores riskier than a random non-defaulter             */
+402        /*   Gini - 2 x AUC - 1                                                                           */
+403        /*                                                                                                */
+404        /**************************************************************************************************/
+405        
+406        %MACRO Score_Validation;
+407        
+408            PROC LOGISTIC INMODEL=MODEL.PdModel;
+409                SCORE DATA=MODEL.ValidWoe OUT=MODEL.ValidScored
+410                      OUTROC=REPORT.RocValid FITSTAT;
+18                                                         The SAS System                      Thursday, August  6, 2026 04:08:16 PM
+
+411            RUN;
+412        
+413            PROC SQL;
+414                CREATE TABLE REPORT.KsSummary AS
+415                SELECT "Training"   AS Sample LABEL="Sample",
+416                       max(_SENSIT_ - _1MSPEC_) AS KS FORMAT=PERCENT8.2 LABEL="KS"
+417                FROM REPORT.RocTrain
+418                UNION
+419                SELECT "Validation", max(_SENSIT_ - _1MSPEC_) FORMAT=PERCENT8.2
+420                FROM REPORT.RocValid;
+421        
+422                TITLE "Discrimination - Training versus Out-of-Time Validation";
+423                SELECT * FROM REPORT.KsSummary;
+424            QUIT;
+425        
+426            TITLE;
+427        
+428        %MEND Score_Validation;
+429        
+430        
+431        /**************************************************************************************************/
+432        /*                                                                                                */
+433        /*   Calibration_Check macro compares predicted default rates with actual, by score band and      */
+434        /*   by origination year                                                                          */
+435        /*   Discrimination asks whether the ranking holds; calibration asks whether the predicted        */
+436        /*   level is right. A model can rank correctly and still under-predict badly                     */
+437        /*                                                                                                */
+438        /**************************************************************************************************/
+439        
+440        %MACRO Calibration_Check;
+441        
+442            PROC RANK DATA=MODEL.ValidScored OUT=WORK.ValidDecile GROUPS=10;
+443                VAR P_1;
+444                RANKS ScoreDecile;
+445            RUN;
+446        
+447            PROC SQL;
+448                CREATE TABLE REPORT.CalibrationByBand AS
+449                SELECT ScoreDecile                LABEL="Score decile",
+450                       count(*)      AS Loans     FORMAT=COMMA12. LABEL="Loans",
+451                       mean(P_1)     AS Predicted FORMAT=PERCENT8.2 LABEL="Predicted default rate",
+452                       mean(DefaultFlag) AS Actual FORMAT=PERCENT8.2 LABEL="Actual default rate"
+453                FROM WORK.ValidDecile
+454                GROUP BY ScoreDecile;
+455        
+456                TITLE "Calibration by Score Decile - Out-of-Time Validation";
+457                SELECT * FROM REPORT.CalibrationByBand;
+458        
+459                CREATE TABLE REPORT.CalibrationByYear AS
+460                SELECT OrigYear                   LABEL="Origination year",
+461                       count(*)      AS Loans     FORMAT=COMMA12. LABEL="Loans",
+462                       mean(P_1)     AS Predicted FORMAT=PERCENT8.2 LABEL="Predicted default rate",
+463                       mean(DefaultFlag) AS Actual FORMAT=PERCENT8.2 LABEL="Actual default rate"
+464                FROM MODEL.ValidScored
+465                GROUP BY OrigYear;
+466        
+467                TITLE "Calibration by Origination Year - Out-of-Time Validation";
+468                SELECT * FROM REPORT.CalibrationByYear;
+19                                                         The SAS System                      Thursday, August  6, 2026 04:08:16 PM
+
+469            QUIT;
+470        
+471            TITLE;
+472        
+473        %MEND Calibration_Check;
+474        
+475        
+476        /**************************************************************************************************/
+477        /*                                                                                                */
+478        /*   Psi_Stability macro measures how far the validation population has drifted from the          */
+479        /*   training population                                                                          */
+480        /*   PSI = sum over bins of (percent new - percent old) x ln(percent new / percent old)           */
+481        /*   Under 0.10 stable, 0.10 to 0.25 minor shift, over 0.25 significant                           */
+482        /*   What is monitored is the model score, not a single predictor: the training scores are        */
+483        /*   cut into ten bands, those cut points are written into a format, and the format is            */
+484        /*   applied unchanged to validation - so validation is never re-ranked                           */
+485        /*                                                                                                */
+486        /**************************************************************************************************/
+487        
+488        %MACRO Psi_Stability;
+489        
+490            /*   Score the training sample so both samples carry a comparable predicted probability   */
+491            PROC LOGISTIC INMODEL=MODEL.PdModel;
+492                SCORE DATA=MODEL.TrainWoe OUT=WORK.TrainScored;
+493            RUN;
+494        
+495            /*   Ten equal training bands and the predicted probability closing each one   */
+496            PROC RANK DATA=WORK.TrainScored OUT=WORK.TrainBand GROUPS=10;
+497                VAR P_1;
+498                RANKS Band;
+499            RUN;
+500        
+501            PROC MEANS DATA=WORK.TrainBand NOPRINT NWAY;
+502                CLASS Band;
+503                VAR P_1;
+504                OUTPUT OUT=WORK.BandCuts (DROP=_TYPE_ _FREQ_) N=NTrain MIN=CutLow MAX=CutHigh;
+505            RUN;
+506        
+507            /*   Turn the training cut points into a format   */
+508            DATA WORK.BandFmt;
+509                SET WORK.BandCuts END=Last;
+510                LENGTH FmtName $8 Label $8;
+511                RETAIN FmtName "PsiBand" Type "N";
+512                Start = CutLow;
+513                End   = CutHigh;
+514                Label = PUT(Band, 2.);
+515                IF _N_  = 1    THEN HLo = "L";
+516                IF Last        THEN HLo = "H";
+517                KEEP FmtName Type Start End Label HLo;
+518            RUN;
+519        
+520            PROC FORMAT CNTLIN=WORK.BandFmt;
+521            RUN;
+522        
+523            /*   Apply the training bands to validation   */
+524            DATA WORK.ValidBand;
+525                SET MODEL.ValidScored (KEEP=P_1);
+526                Band = INPUT(PUT(P_1, PsiBand.), 2.);
+20                                                         The SAS System                      Thursday, August  6, 2026 04:08:16 PM
+
+527            RUN;
+528        
+529            PROC MEANS DATA=WORK.ValidBand NOPRINT NWAY;
+530                CLASS Band;
+531                VAR P_1;
+532                OUTPUT OUT=WORK.ValidCounts (DROP=_TYPE_ _FREQ_) N=NValid;
+533            RUN;
+534        
+535            /*   Compare the two distributions band by band   */
+536            DATA REPORT.Psi;
+537                MERGE WORK.BandCuts (KEEP=Band NTrain CutHigh)
+538                      WORK.ValidCounts;
+539                BY Band;
+540                IF NValid = . THEN NValid = 0;
+541            RUN;
+542        
+543            PROC SQL NOPRINT;
+544                SELECT sum(NTrain), sum(NValid)
+545                  INTO :SumTrain trimmed, :SumValid trimmed
+546                FROM REPORT.Psi;
+547            QUIT;
+548        
+549            DATA REPORT.Psi;
+550                SET REPORT.Psi END=Last;
+551                RETAIN PsiTotal 0;
+552        
+553                PctTrain = NTrain / &SumTrain;
+554                PctValid = NValid / &SumValid;
+555        
+556                IF PctTrain > 0 AND PctValid > 0 THEN
+557                    PsiPart = (PctValid - PctTrain) * log(PctValid / PctTrain);
+558                ELSE PsiPart = 0;
+559        
+560                PsiTotal + PsiPart;
+561                IF Last THEN Psi = PsiTotal;
+562        
+563                FORMAT NTrain NValid COMMA12. PctTrain PctValid PERCENT8.2
+564                       CutHigh PERCENT8.3 PsiPart Psi 8.4;
+565                LABEL Band     = "Score band"
+566                      CutHigh  = "Predicted default at band top"
+567                      NTrain   = "Training loans"
+568                      NValid   = "Validation loans"
+569                      PctTrain = "Percent training"
+570                      PctValid = "Percent validation"
+571                      PsiPart  = "PSI contribution"
+572                      Psi      = "Population Stability Index";
+573                DROP PsiTotal;
+574            RUN;
+575        
+576            PROC PRINT DATA=REPORT.Psi NOOBS LABEL;
+577                TITLE "Population Stability Index - Training versus Out-of-Time Validation";
+578                VAR Band CutHigh NTrain NValid PctTrain PctValid PsiPart Psi;
+579            RUN;
+580        
+581            TITLE;
+582        
+583        %MEND Psi_Stability;
+584        
+21                                                         The SAS System                      Thursday, August  6, 2026 04:08:16 PM
+
+585        %Points_Scorecard;
+
+NOTE: The data set WORK._CLASSES has 25 observations and 5 variables.
+NOTE: DATA statement used (Total process time):
+      real time           0.00 seconds
+      user cpu time       0.01 seconds
+      system cpu time     0.00 seconds
+      memory              612.25k
+      OS Memory           31656.00k
+      Timestamp           08/06/2026 11:08:16 PM
+      Step Count                        67  Switch Count  2
+      Page Faults                       0
+      Page Reclaims                     92
+      Page Swaps                        0
+      Voluntary Context Switches        12
+      Involuntary Context Switches      0
+      Block Input Operations            0
+      Block Output Operations           264
+      
+
+NOTE: PROCEDURE SQL used (Total process time):
+      real time           0.00 seconds
+      user cpu time       0.00 seconds
+      system cpu time     0.00 seconds
+      memory              5603.43k
+      OS Memory           36780.00k
+      Timestamp           08/06/2026 11:08:16 PM
+      Step Count                        68  Switch Count  0
+      Page Faults                       0
+      Page Reclaims                     50
+      Page Swaps                        0
+      Voluntary Context Switches        11
+      Involuntary Context Switches      0
+      Block Input Operations            0
+      Block Output Operations           0
+      
+
+NOTE: Compressing data set SCORE.POINTS increased size by 100.00 percent. 
+      Compressed is 2 pages; un-compressed would require 1 pages.
+NOTE: Table SCORE.POINTS created, with 25 rows and 6 columns.
+
+NOTE: PROCEDURE SQL used (Total process time):
+      real time           0.02 seconds
+      user cpu time       0.00 seconds
+      system cpu time     0.01 seconds
+      memory              7389.64k
+      OS Memory           37732.00k
+      Timestamp           08/06/2026 11:08:16 PM
+      Step Count                        69  Switch Count  1
+      Page Faults                       0
+      Page Reclaims                     334
+      Page Swaps                        0
+      Voluntary Context Switches        59
+      Involuntary Context Switches      0
+      Block Input Operations            0
+      Block Output Operations           528
+      
+
+22                                                         The SAS System                      Thursday, August  6, 2026 04:08:16 PM
+
+NOTE: There were 25 observations read from the data set SCORE.POINTS.
+NOTE: PROCEDURE PRINT used (Total process time):
+      real time           0.02 seconds
+      user cpu time       0.02 seconds
+      system cpu time     0.00 seconds
+      memory              608.56k
+      OS Memory           32936.00k
+      Timestamp           08/06/2026 11:08:16 PM
+      Step Count                        70  Switch Count  2
+      Page Faults                       0
+      Page Reclaims                     74
+      Page Swaps                        0
+      Voluntary Context Switches        21
+      Involuntary Context Switches      2
+      Block Input Operations            0
+      Block Output Operations           0
+      
+
+586        
+587        %Score_Validation;
+
+NOTE: The data set MODEL.VALIDSCORED has 2190651 observations and 26 variables.
+NOTE: Compressing data set MODEL.VALIDSCORED decreased size by 0.37 percent. 
+      Compressed is 2136 pages; un-compressed would require 2144 pages.
+NOTE: The data set REPORT.ROCVALID has 693 observations and 7 variables.
+NOTE: Compressing data set REPORT.ROCVALID increased size by 100.00 percent. 
+      Compressed is 2 pages; un-compressed would require 1 pages.
+NOTE: PROCEDURE LOGISTIC used (Total process time):
+      real time           4.19 seconds
+      user cpu time       3.04 seconds
+      system cpu time     0.50 seconds
+      memory              130769.87k
+      OS Memory           165868.00k
+      Timestamp           08/06/2026 11:08:21 PM
+      Step Count                        71  Switch Count  3
+      Page Faults                       0
+      Page Reclaims                     31834
+      Page Swaps                        0
+      Voluntary Context Switches        4772
+      Involuntary Context Switches      24
+      Block Input Operations            0
+      Block Output Operations           819272
+      
+
+NOTE: Compression was disabled for data set REPORT.KSSUMMARY because compression overhead would increase the size of the data set.
+NOTE: Table REPORT.KSSUMMARY created, with 2 rows and 2 columns.
+
+NOTE: PROCEDURE SQL used (Total process time):
+      real time           0.03 seconds
+      user cpu time       0.00 seconds
+      system cpu time     0.00 seconds
+      memory              6058.34k
+      OS Memory           38832.00k
+      Timestamp           08/06/2026 11:08:21 PM
+      Step Count                        72  Switch Count  5
+      Page Faults                       0
+      Page Reclaims                     199
+      Page Swaps                        0
+23                                                         The SAS System                      Thursday, August  6, 2026 04:08:21 PM
+
+      Voluntary Context Switches        67
+      Involuntary Context Switches      1
+      Block Input Operations            0
+      Block Output Operations           264
+      
+
+588        
+589        %Calibration_Check;
+
+NOTE: The data set WORK.VALIDDECILE has 2190651 observations and 27 variables.
+NOTE: PROCEDURE RANK used (Total process time):
+      real time           1.75 seconds
+      user cpu time       1.11 seconds
+      system cpu time     0.36 seconds
+      memory              55992.34k
+      OS Memory           88640.00k
+      Timestamp           08/06/2026 11:08:22 PM
+      Step Count                        73  Switch Count  4
+      Page Faults                       0
+      Page Reclaims                     1810
+      Page Swaps                        0
+      Voluntary Context Switches        2224
+      Involuntary Context Switches      16
+      Block Input Operations            0
+      Block Output Operations           583440
+      
+
+NOTE: Compressing data set REPORT.CALIBRATIONBYBAND increased size by 100.00 percent. 
+      Compressed is 2 pages; un-compressed would require 1 pages.
+NOTE: Table REPORT.CALIBRATIONBYBAND created, with 10 rows and 4 columns.
+
+NOTE: Compressing data set REPORT.CALIBRATIONBYYEAR increased size by 100.00 percent. 
+      Compressed is 2 pages; un-compressed would require 1 pages.
+NOTE: Table REPORT.CALIBRATIONBYYEAR created, with 2 rows and 4 columns.
+
+NOTE: PROCEDURE SQL used (Total process time):
+      real time           1.14 seconds
+      user cpu time       1.74 seconds
+      system cpu time     0.25 seconds
+      memory              109936.20k
+      OS Memory           140884.00k
+      Timestamp           08/06/2026 11:08:23 PM
+      Step Count                        74  Switch Count  14
+      Page Faults                       0
+      Page Reclaims                     39243
+      Page Swaps                        0
+      Voluntary Context Switches        4506
+      Involuntary Context Switches      6
+      Block Input Operations            0
+      Block Output Operations           1056
+      
+
+590        
+591        %Psi_Stability;
+
+NOTE: The data set WORK.TRAINSCORED has 16793948 observations and 26 variables.
+NOTE: PROCEDURE LOGISTIC used (Total process time):
+      real time           7.32 seconds
+24                                                         The SAS System                      Thursday, August  6, 2026 04:08:31 PM
+
+      user cpu time       6.10 seconds
+      system cpu time     1.15 seconds
+      memory              4340.56k
+      OS Memory           38064.00k
+      Timestamp           08/06/2026 11:08:31 PM
+      Step Count                        75  Switch Count  19
+      Page Faults                       0
+      Page Reclaims                     730
+      Page Swaps                        0
+      Voluntary Context Switches        64
+      Involuntary Context Switches      29
+      Block Input Operations            0
+      Block Output Operations           4206856
+      
+
+
+NOTE: The data set WORK.TRAINBAND has 16793948 observations and 27 variables.
+NOTE: PROCEDURE RANK used (Total process time):
+      real time           6.41 seconds
+      user cpu time       4.64 seconds
+      system cpu time     1.71 seconds
+      memory              397682.53k
+      OS Memory           430396.00k
+      Timestamp           08/06/2026 11:08:37 PM
+      Step Count                        76  Switch Count  12
+      Page Faults                       0
+      Page Reclaims                     1388
+      Page Swaps                        0
+      Voluntary Context Switches        42
+      Involuntary Context Switches      18
+      Block Input Operations            0
+      Block Output Operations           4469520
+      
+
+
+NOTE: There were 16793948 observations read from the data set WORK.TRAINBAND.
+NOTE: The data set WORK.BANDCUTS has 10 observations and 4 variables.
+NOTE: PROCEDURE MEANS used (Total process time):
+      real time           0.67 seconds
+      user cpu time       1.94 seconds
+      system cpu time     0.34 seconds
+      memory              10516.46k
+      OS Memory           42688.00k
+      Timestamp           08/06/2026 11:08:38 PM
+      Step Count                        77  Switch Count  2
+      Page Faults                       0
+      Page Reclaims                     2362
+      Page Swaps                        0
+      Voluntary Context Switches        2771
+      Involuntary Context Switches      11
+      Block Input Operations            0
+      Block Output Operations           264
+      
+
+
+NOTE: There were 10 observations read from the data set WORK.BANDCUTS.
+NOTE: The data set WORK.BANDFMT has 10 observations and 6 variables.
+NOTE: DATA statement used (Total process time):
+25                                                         The SAS System                      Thursday, August  6, 2026 04:08:38 PM
+
+      real time           0.00 seconds
+      user cpu time       0.00 seconds
+      system cpu time     0.01 seconds
+      memory              810.78k
+      OS Memory           33964.00k
+      Timestamp           08/06/2026 11:08:38 PM
+      Step Count                        78  Switch Count  2
+      Page Faults                       0
+      Page Reclaims                     121
+      Page Swaps                        0
+      Voluntary Context Switches        10
+      Involuntary Context Switches      0
+      Block Input Operations            0
+      Block Output Operations           264
+      
+
+NOTE: Format PSIBAND has been output.
+
+NOTE: PROCEDURE FORMAT used (Total process time):
+      real time           0.00 seconds
+      user cpu time       0.00 seconds
+      system cpu time     0.00 seconds
+      memory              443.50k
+      OS Memory           33704.00k
+      Timestamp           08/06/2026 11:08:38 PM
+      Step Count                        79  Switch Count  0
+      Page Faults                       0
+      Page Reclaims                     48
+      Page Swaps                        0
+      Voluntary Context Switches        0
+      Involuntary Context Switches      0
+      Block Input Operations            0
+      Block Output Operations           40
+      
+NOTE: There were 10 observations read from the data set WORK.BANDFMT.
+
+
+NOTE: There were 2190651 observations read from the data set MODEL.VALIDSCORED.
+NOTE: The data set WORK.VALIDBAND has 2190651 observations and 2 variables.
+NOTE: DATA statement used (Total process time):
+      real time           0.73 seconds
+      user cpu time       0.64 seconds
+      system cpu time     0.09 seconds
+      memory              3995.90k
+      OS Memory           37548.00k
+      Timestamp           08/06/2026 11:08:39 PM
+      Step Count                        80  Switch Count  2
+      Page Faults                       0
+      Page Reclaims                     672
+      Page Swaps                        0
+      Voluntary Context Switches        16
+      Involuntary Context Switches      3
+      Block Input Operations            0
+      Block Output Operations           69128
+      
+
+
+NOTE: There were 2190651 observations read from the data set WORK.VALIDBAND.
+26                                                         The SAS System                      Thursday, August  6, 2026 04:08:39 PM
+
+NOTE: The data set WORK.VALIDCOUNTS has 10 observations and 2 variables.
+NOTE: PROCEDURE MEANS used (Total process time):
+      real time           0.09 seconds
+      user cpu time       0.23 seconds
+      system cpu time     0.01 seconds
+      memory              10503.78k
+      OS Memory           42688.00k
+      Timestamp           08/06/2026 11:08:39 PM
+      Step Count                        81  Switch Count  2
+      Page Faults                       0
+      Page Reclaims                     2305
+      Page Swaps                        0
+      Voluntary Context Switches        402
+      Involuntary Context Switches      2
+      Block Input Operations            0
+      Block Output Operations           264
+      
+
+
+NOTE: There were 10 observations read from the data set WORK.BANDCUTS.
+NOTE: There were 10 observations read from the data set WORK.VALIDCOUNTS.
+NOTE: The data set REPORT.PSI has 10 observations and 4 variables.
+NOTE: Compressing data set REPORT.PSI increased size by 100.00 percent. 
+      Compressed is 2 pages; un-compressed would require 1 pages.
+NOTE: DATA statement used (Total process time):
+      real time           0.01 seconds
+      user cpu time       0.01 seconds
+      system cpu time     0.01 seconds
+      memory              1357.21k
+      OS Memory           34224.00k
+      Timestamp           08/06/2026 11:08:39 PM
+      Step Count                        82  Switch Count  1
+      Page Faults                       0
+      Page Reclaims                     155
+      Page Swaps                        0
+      Voluntary Context Switches        42
+      Involuntary Context Switches      0
+      Block Input Operations            0
+      Block Output Operations           520
+      
+
+NOTE: PROCEDURE SQL used (Total process time):
+      real time           0.00 seconds
+      user cpu time       0.00 seconds
+      system cpu time     0.00 seconds
+      memory              5613.50k
+      OS Memory           38828.00k
+      Timestamp           08/06/2026 11:08:39 PM
+      Step Count                        83  Switch Count  0
+      Page Faults                       0
+      Page Reclaims                     52
+      Page Swaps                        0
+      Voluntary Context Switches        10
+      Involuntary Context Switches      0
+      Block Input Operations            0
+      Block Output Operations           0
+      
+
+27                                                         The SAS System                      Thursday, August  6, 2026 04:08:39 PM
+
+
+NOTE: There were 10 observations read from the data set REPORT.PSI.
+NOTE: The data set REPORT.PSI has 10 observations and 8 variables.
+NOTE: Compressing data set REPORT.PSI increased size by 100.00 percent. 
+      Compressed is 2 pages; un-compressed would require 1 pages.
+NOTE: DATA statement used (Total process time):
+      real time           0.01 seconds
+      user cpu time       0.00 seconds
+      system cpu time     0.00 seconds
+      memory              1063.62k
+      OS Memory           33964.00k
+      Timestamp           08/06/2026 11:08:39 PM
+      Step Count                        84  Switch Count  1
+      Page Faults                       0
+      Page Reclaims                     121
+      Page Swaps                        0
+      Voluntary Context Switches        43
+      Involuntary Context Switches      0
+      Block Input Operations            0
+      Block Output Operations           520
+      
+
+
+NOTE: There were 10 observations read from the data set REPORT.PSI.
+NOTE: PROCEDURE PRINT used (Total process time):
+      real time           0.02 seconds
+      user cpu time       0.01 seconds
+      system cpu time     0.00 seconds
+      memory              667.65k
+      OS Memory           33704.00k
+      Timestamp           08/06/2026 11:08:39 PM
+      Step Count                        85  Switch Count  1
+      Page Faults                       0
+      Page Reclaims                     61
+      Page Swaps                        0
+      Voluntary Context Switches        15
+      Involuntary Context Switches      0
+      Block Input Operations            0
+      Block Output Operations           0
+      
+
+592        
+593        /**************************************************************************************************/
+594        /**************************************************************************************************/
+595        /**************************************************************************************************/
+596        
+597        /**************************************************************************************************/
+598        /*                                                                                                */
+599        /*   Generate_Pdf macro produces the model development report as a PDF                   */
+600        /*   Cover, introduction, source data, methodology, portfolio, risk profile, discrimination,      */
+601        /*   calibration, stability, glossary, and the ETL processing record as an appendix               */
+602        /*   Last step, run %Generate_Pdf; after every modeling stage is complete                */
+603        /*                                                                                                */
+604        /**************************************************************************************************/
+605        
+606        %MACRO Generate_Pdf;
+607        
+608            PROC TEMPLATE;
+28                                                         The SAS System                      Thursday, August  6, 2026 04:08:39 PM
+
+609                DEFINE STYLE ScorecardStyle;
+610                    PARENT = Styles.Pearl;
+611                    CLASS Fonts /
+612                        'TitleFont'    = ("Helvetica", 13PT, BOLD)
+613                        'HeadingFont'  = ("Helvetica", 10PT, BOLD)
+614                        'DocFont'      = ("Helvetica", 9PT);
+615                    CLASS Header       / BACKGROUNDCOLOR=CX1F4E79 COLOR=WHITE;
+616                    CLASS SystemTitle  / COLOR=CX1F4E79 FONTSIZE=13PT;
+617                    CLASS SystemTitle2 / COLOR=CX1F4E79 FONTSIZE=12PT FONTWEIGHT=MEDIUM;
+618                END;
+619            RUN;
+620        
+621            OPTIONS NODATE NONUMBER ORIENTATION=PORTRAIT
+622                    TOPMARGIN=1IN BOTTOMMARGIN=1IN LEFTMARGIN=1IN RIGHTMARGIN=1IN;
+623            ODS _ALL_ CLOSE;
+624            ODS GRAPHICS ON / WIDTH=6.4IN HEIGHT=2.6IN OUTPUTFMT=PNG;
+625            ODS ESCAPECHAR='^';
+626        
+627            /*   CONTENTS=NO so the cover is page 1 - the contents page is written by hand below,    */
+628            /*   and the PDF bookmark panel still navigates the sections                              */
+629            ODS PDF FILE="&root/CreditRiskScorecard_Report.pdf"
+630                    STYLE=ScorecardStyle STARTPAGE=NO CONTENTS=NO;
+631        
+632            /*   Cover   */
+633            PROC ODSTEXT;
+634                P " " / STYLE=[FONTSIZE=5PT];
+635                P " " / STYLE=[FONTSIZE=5PT];
+636            RUN;
+637            PROC ODSTEXT;
+638                P "Credit Risk Scorecard"
+639                  / STYLE=[FONTSIZE=22PT FONTWEIGHT=BOLD COLOR=CX1F4E79 JUST=CENTER];
+640                P "Out-of-Time Validation Through the 2008 Crisis"
+641                  / STYLE=[FONTSIZE=13PT FONTWEIGHT=BOLD COLOR=CX1F4E79 JUST=CENTER];
+642                P "Trained on 2000-2005 loans"
+643                  / STYLE=[FONTSIZE=12PT COLOR=CX1F4E79 JUST=CENTER];
+644                P "Tested on 2006-2007 loans"
+645                  / STYLE=[FONTSIZE=12PT COLOR=CX1F4E79 JUST=CENTER];
+646                P " " / STYLE=[FONTSIZE=5PT];
+647                P " " / STYLE=[FONTSIZE=5PT];
+648                P "Fannie Mae Single-Family Loan Performance Data"
+649                  / STYLE=[FONTSIZE=12PT COLOR=CX1F4E79 JUST=CENTER];
+650                P "Anne M. Prihoda"
+651                  / STYLE=[FONTSIZE=12PT COLOR=CX1F4E79 JUST=CENTER];
+652                P " " / STYLE=[FONTSIZE=5PT];
+653                P " " / STYLE=[FONTSIZE=5PT];
+654                P " " / STYLE=[FONTSIZE=5PT];
+655                P "What this report covers"
+656                  / STYLE=[FONTSIZE=12PT FONTWEIGHT=BOLD COLOR=CX1F4E79];
+657                P " " / STYLE=[FONTSIZE=5PT];
+658                P "^{unicode 2022}  Builds a loan-level credit risk scorecard on 2000 to 2005 mortgage originations using
+658      ! predictor binning, Weight of Evidence, logistic regression, and points scaling"
+659                  / STYLE=[FONTSIZE=10PT];
+660                P " " / STYLE=[FONTSIZE=5PT];
+661                P "^{unicode 2022}  Validates the scorecard out-of-time on 2006 to 2007 originations, which seasoned through the
+661      ! housing crisis"
+662                  / STYLE=[FONTSIZE=10PT];
+663                P " " / STYLE=[FONTSIZE=5PT];
+664                P "^{unicode 2022}  Weight of Evidence (WOE) converts each predictor onto a common risk scale by comparing,
+29                                                         The SAS System                      Thursday, August  6, 2026 04:08:39 PM
+
+664      ! within each range of values, the share of loans that repaid against the share that defaulted. Information Value (IV) sums
+664      !  that separation across all ranges into a single number measuring how much a predictor is worth"
+NOTE: The quoted string currently being processed has become more than 262 bytes long.  You might have unbalanced quotation marks.
+665                  / STYLE=[FONTSIZE=10PT];
+666                P " " / STYLE=[FONTSIZE=5PT];
+667                P "^{unicode 2022}  Discrimination is measured by the Kolmogorov-Smirnov statistic (KS), the widest gap between
+667      ! defaults captured and non-defaults captured, and by the ROC curve and the area beneath it (AUC)"
+668                  / STYLE=[FONTSIZE=10PT];
+669                P " " / STYLE=[FONTSIZE=5PT];
+670                P "^{unicode 2022}  Calibration asks whether the predicted level of default is right, comparing predicted against
+670      !  actual by score band and by origination year. A model can rank loans correctly and still badly understate how many will
+670      ! default"
+671                  / STYLE=[FONTSIZE=10PT];
+672                P " " / STYLE=[FONTSIZE=5PT];
+673                P "^{unicode 2022}  Population stability asks whether the applicants being scored still resemble those the model
+673      ! was built on, measured by the Population Stability Index (PSI), the standard early warning in model monitoring"
+674                  / STYLE=[FONTSIZE=10PT];
+675                P " " / STYLE=[FONTSIZE=5PT];
+676                P "^{unicode 2022}  Data prepared by the ETL pipeline: 1,178,508,035 monthly records across 48 quarterly files,
+676      ! reconciled to Fannie Mae published statistical summaries"
+677                  / STYLE=[FONTSIZE=10PT];
+678            RUN;
+679            ODS PDF STARTPAGE=NOW;
+680        
+681            /*   Contents - written by hand so the cover can be page 1                                */
+682            /*   Every narrative paragraph in this report is written through PROC ODSTEXT at 10PT,     */
+683            /*   so the contents, the cover and the section commentary all render at the same size     */
+684            PROC ODSTEXT;
+685                P "Contents"
+686                  / STYLE=[FONTSIZE=12PT FONTWEIGHT=BOLD COLOR=CX1F4E79];
+687            RUN;
+688            PROC ODSTEXT;
+689                P "1.  Portfolio Composition and Observed Default"
+690                  / STYLE=[FONTSIZE=12PT COLOR=CX1F4E79];
+691                P "2.  Credit Score Risk Profile"
+692                  / STYLE=[FONTSIZE=12PT COLOR=CX1F4E79];
+693                P "3.  The Scorecard"
+694                  / STYLE=[FONTSIZE=12PT COLOR=CX1F4E79];
+695                P "4.  Model Discrimination"
+696                  / STYLE=[FONTSIZE=12PT COLOR=CX1F4E79];
+697                P "5.  Calibration - Predicted versus Actual"
+698                  / STYLE=[FONTSIZE=12PT COLOR=CX1F4E79];
+699                P "6.  Population Stability"
+700                  / STYLE=[FONTSIZE=12PT COLOR=CX1F4E79];
+701                P "Appendix.  Data Processing Record"
+702                  / STYLE=[FONTSIZE=12PT COLOR=CX1F4E79];
+703                P " " / STYLE=[FONTSIZE=5PT];
+704            RUN;
+705        
+706            /*   Section 1 - portfolio, on the same page as the contents   */
+707            ODS PROCLABEL "1. Portfolio and Observed Default";
+708            TITLE1 "1.  Portfolio Composition and Observed Default";
+709            PROC ODSTEXT;
+710                P "^{unicode 2022}  19.1 million prime, fully documented, fixed-rate mortgages acquired by Fannie Mae between
+710      ! 2000 and 2007"
+711                  / STYLE=[FONTSIZE=10PT];
+712                P "^{unicode 2022}  Loan counts and default rates reconcile to Fannie Mae published summaries within a few basis
+712      ! points on every vintage"
+30                                                         The SAS System                      Thursday, August  6, 2026 04:08:39 PM
+
+713                  / STYLE=[FONTSIZE=10PT];
+714                P "^{unicode 2022}  Default rates hold between 1.2 and 1.6 percent for loans made from 2000 through 2003"
+715                  / STYLE=[FONTSIZE=10PT];
+716                P "^{unicode 2022}  They then climb steeply: 3.2 percent in 2004, 6.0 percent in 2005, and 8 to 9 percent in 2006
+716      !  and 2007"
+717                  / STYLE=[FONTSIZE=10PT];
+718                P "^{unicode 2022}  That is a sevenfold deterioration inside the safest segment of the mortgage market"
+719                  / STYLE=[FONTSIZE=10PT];
+720                P "^{unicode 2022}  It happened with no comparable movement in the characteristics lenders were underwriting on"
+721                  / STYLE=[FONTSIZE=10PT];
+722            RUN;
+723            PROC SQL;
+724                SELECT OrigYear          LABEL="Origination year",
+725                       count(*)           AS Loans    FORMAT=COMMA12. LABEL="Loans",
+726                       sum(DefaultFlag)   AS Defaults FORMAT=COMMA12. LABEL="Defaults",
+727                       mean(DefaultFlag)  AS DefRate  FORMAT=PERCENT8.2 LABEL="Default rate"
+728                FROM MODEL.ModelBase
+729                GROUP BY OrigYear;
+730            QUIT;
+731        
+732            /*   Summarize before plotting - SGPLOT cannot render 19 million rows directly   */
+733            PROC MEANS DATA=MODEL.ModelBase NOPRINT NWAY;
+734                CLASS OrigYear;
+735                VAR DefaultFlag;
+736                OUTPUT OUT=WORK._YearRate (DROP=_TYPE_ _FREQ_) MEAN=DefRate;
+737            RUN;
+738        
+739            TITLE2 "Observed default rate by origination year";
+740            PROC SGPLOT DATA=WORK._YearRate;
+741                VBAR OrigYear / RESPONSE=DefRate FILLATTRS=(COLOR=CX1F4E79);
+742                YAXIS LABEL="Default rate" VALUESFORMAT=PERCENT8.1 GRID;
+743                XAXIS LABEL="Origination year";
+744            RUN;
+745        
+746            /*   Section 2 - risk profile   */
+747            ODS PDF STARTPAGE=NOW;
+748            ODS PROCLABEL "2. Credit Score Risk Profile";
+749            TITLE1 "2.  Credit Score Risk Profile";
+750            TITLE2 "Weight of Evidence by fine bin, training sample";
+751            PROC ODSTEXT;
+752                P "^{unicode 2022}  Each bar is one twentieth of the training population, weakest credit scores on the left,
+752      ! strongest on the right"
+753                  / STYLE=[FONTSIZE=10PT];
+754                P "^{unicode 2022}  Weight of Evidence compares a bin's share of loans that repaid with its share that defaulted"
+755                  / STYLE=[FONTSIZE=10PT];
+756                P "^{unicode 2022}  Bars below zero hold more than their share of defaults; bars above zero hold fewer"
+757                  / STYLE=[FONTSIZE=10PT];
+758                P "^{unicode 2022}  The climb from minus 0.90 to plus 1.38 is steady and almost perfectly ordered"
+759                  / STYLE=[FONTSIZE=10PT];
+760                P "^{unicode 2022}  Information Value of 0.53 on 16.8 million loans, the strongest characteristic tested"
+761                  / STYLE=[FONTSIZE=10PT];
+762            RUN;
+763            PROC SGPLOT DATA=SCORE.FicoBins;
+764                VBAR RFico / RESPONSE=Woe FILLATTRS=(COLOR=CX1F4E79);
+765                YAXIS LABEL="Weight of Evidence" GRID;
+766                XAXIS LABEL="Credit score bin, 0 is highest risk";
+767            RUN;
+768        
+31                                                         The SAS System                      Thursday, August  6, 2026 04:08:39 PM
+
+769            PROC PRINT DATA=SCORE.FicoBins NOOBS LABEL;
+770                VAR RFico RawMin RawMax NLoans NBad Woe;
+771                LABEL RFico="Bin" RawMin="From" RawMax="To" NLoans="Loans"
+772                      NBad="Defaults" Woe="WOE";
+773            RUN;
+774        
+775            /*   Section 3 - the scorecard   */
+776            ODS PDF STARTPAGE=NOW;
+777            ODS PROCLABEL "3. The Scorecard";
+778            TITLE1 "3.  The Scorecard";
+779            TITLE2 "Points by characteristic and class";
+780            PROC ODSTEXT;
+781                P "^{unicode 2022}  Add the points for each of the three characteristics to obtain the loan score"
+782                  / STYLE=[FONTSIZE=10PT];
+783                P "^{unicode 2022}  Higher points mean lower risk"
+784                  / STYLE=[FONTSIZE=10PT];
+785                P "^{unicode 2022}  600 points corresponds to 50 to 1 odds of repayment"
+786                  / STYLE=[FONTSIZE=10PT];
+787                P "^{unicode 2022}  Every 20 additional points doubles those odds"
+788                  / STYLE=[FONTSIZE=10PT];
+789            RUN;
+790        
+791            PROC PRINT DATA=SCORE.Points NOOBS LABEL;
+792                VAR Characteristic Bin Woe Points;
+793            RUN;
+794        
+795            /*   Section 4 - discrimination   */
+796            ODS PDF STARTPAGE=NOW;
+797            ODS PROCLABEL "4. Discrimination";
+798            TITLE1 "4.  Model Discrimination";
+799            TITLE2 "Out-of-time validation";
+800            PROC ODSTEXT;
+801                P "^{unicode 2022}  Discrimination asks whether the model puts riskier loans ahead of safer ones"
+802                  / STYLE=[FONTSIZE=10PT];
+803                P "^{unicode 2022}  KS is the widest gap between defaults captured and non-defaults captured, working from worst
+803      ! score to best"
+804                  / STYLE=[FONTSIZE=10PT];
+805                P "^{unicode 2022}  The ROC curve shows the same separation: The further it bows above the diagonal, the better
+805      ! the ranking"
+806                  / STYLE=[FONTSIZE=10PT];
+807                P "^{unicode 2022}  The model was fitted on 2000 to 2005 loans and applied untouched to 2006 and 2007 loans it
+807      ! had never seen"
+808                  / STYLE=[FONTSIZE=10PT];
+809                P "^{unicode 2022}  KS falls only from 37.3 to 32.1, and area under the curve from 0.746 to 0.716"
+810                  / STYLE=[FONTSIZE=10PT];
+811                P "^{unicode 2022}  The ranking held: Riskier loans still scored worse and safer loans still scored better, on
+811      ! loans originated after the training period"
+812                  / STYLE=[FONTSIZE=10PT];
+813                P "^{unicode 2022}  Ranking correctly is not the same as predicting correctly: Section 5 shows the predicted
+813      ! level of default was far too low"
+814                  / STYLE=[FONTSIZE=10PT];
+815            RUN;
+816            PROC PRINT DATA=REPORT.KsSummary NOOBS LABEL;
+817            RUN;
+818        
+819            PROC SGPLOT DATA=REPORT.RocValid ASPECT=1;
+820                TITLE2 "ROC curve - validation sample";
+821                SERIES X=_1MSPEC_ Y=_SENSIT_ / LINEATTRS=(COLOR=CX1F4E79 THICKNESS=2);
+32                                                         The SAS System                      Thursday, August  6, 2026 04:08:39 PM
+
+822                LINEPARM X=0 Y=0 SLOPE=1 / LINEATTRS=(PATTERN=SHORTDASH COLOR=GRAY);
+823                XAXIS LABEL="False positive rate" GRID;
+824                YAXIS LABEL="True positive rate" GRID;
+825            RUN;
+826        
+827            /*   Section 5 - calibration   */
+828            ODS PDF STARTPAGE=NOW;
+829            ODS PROCLABEL "5. Calibration";
+830            TITLE1 "5.  Calibration - Predicted versus Actual";
+831            TITLE2 "By score decile";
+832            PROC ODSTEXT;
+833                P "^{unicode 2022}  Discrimination asks whether the ordering is right; Calibration asks whether the predicted
+833      ! level is right"
+834                  / STYLE=[FONTSIZE=10PT];
+835                P "^{unicode 2022}  A model can rank every loan correctly and still be badly wrong about how many will default"
+836                  / STYLE=[FONTSIZE=10PT];
+837                P "^{unicode 2022}  Ordering is flawless: Predicted default rises from 0.19 to 6.28 percent across deciles,
+837      ! actual from 0.54 to 19.64 percent"
+838                  / STYLE=[FONTSIZE=10PT];
+839                P "^{unicode 2022}  Every decile is in the right place, and every decile is understated by a factor of three to
+839      ! four"
+840                  / STYLE=[FONTSIZE=10PT];
+841                P "^{unicode 2022}  2006 originations: Predicted default rate 2.10 percent, actual default rate 8.17 percent"
+842                  / STYLE=[FONTSIZE=10PT];
+843                P "^{unicode 2022}  2007 originations: Predicted default rate 2.26 percent, actual default rate 8.94 percent"
+844                  / STYLE=[FONTSIZE=10PT];
+845                P "^{unicode 2022}  The model barely separated the two vintages because the applicants barely differed"
+846                  / STYLE=[FONTSIZE=10PT];
+847                P "^{unicode 2022}  The difference was in the environment those loans matured into, which no origination
+847      ! characteristic can express"
+848                  / STYLE=[FONTSIZE=10PT];
+849            RUN;
+850            PROC PRINT DATA=REPORT.CalibrationByBand NOOBS LABEL;
+851            RUN;
+852        
+853            TITLE2 "By origination year";
+854            PROC PRINT DATA=REPORT.CalibrationByYear NOOBS LABEL;
+855            RUN;
+856        
+857            /*   Section 6 - stability   */
+858            ODS PDF STARTPAGE=NOW;
+859            ODS PROCLABEL "6. Population Stability";
+860            TITLE1 "6.  Population Stability";
+861            TITLE2 "Training versus validation score distribution";
+862            PROC ODSTEXT;
+863                P "^{unicode 2022}  PSI compares the score distribution of the new population against the population the model
+863      ! was built on"
+864                  / STYLE=[FONTSIZE=10PT];
+865                P "^{unicode 2022}  Below 0.10 is stable and requires no action; 0.10 to 0.25 is a minor shift; Above 0.25 calls
+865      ! for investigation or a rebuild"
+866                  / STYLE=[FONTSIZE=10PT];
+867                P "^{unicode 2022}  The index comes to 0.031, comfortably inside the stable range"
+868                  / STYLE=[FONTSIZE=10PT];
+869                P "^{unicode 2022}  Applicants arriving in 2006 and 2007 looked very much like those the model was trained on"
+870                  / STYLE=[FONTSIZE=10PT];
+871                P "^{unicode 2022}  A monitoring report built on this measure would have raised no alarm while the book defaulted
+871      !  at four times the predicted rate"
+872                  / STYLE=[FONTSIZE=10PT];
+33                                                         The SAS System                      Thursday, August  6, 2026 04:08:39 PM
+
+873                P "^{unicode 2022}  The scorecard method worked: It ranked risk correctly and its inputs stayed stable"
+874                  / STYLE=[FONTSIZE=10PT];
+875                P "^{unicode 2022}  What failed was the assumption that the relationship between borrower characteristics and
+875      ! default holds steady over time"
+876                  / STYLE=[FONTSIZE=10PT];
+877                P "^{unicode 2022}  Population monitoring cannot detect that failure because it watches applicants rather than
+877      ! outcomes"
+878                  / STYLE=[FONTSIZE=10PT];
+879                P "^{unicode 2022}  Actual-versus-predicted tracking, shown in Section 5, is what would have caught it, within
+879      ! months of the 2006 vintage seasoning"
+880                  / STYLE=[FONTSIZE=10PT];
+881            RUN;
+882            PROC PRINT DATA=REPORT.Psi NOOBS LABEL;
+883                VAR Band CutHigh NTrain NValid PctTrain PctValid PsiPart Psi;
+884            RUN;
+885        
+886            /*   Appendix - the ETL processing record, reproduced exactly as it appears in the        */
+887            /*   ETL Pipeline report so readers can match the two projects                            */
+888            ODS PDF STARTPAGE=NOW;
+889            ODS PROCLABEL "Appendix. Data Processing Record";
+890            TITLE1 "Appendix.  Data Processing Record";
+891            TITLE2 "ETL Pipeline Processing Record";
+892        
+893            /*   Narrower margins and a smaller font so all eight columns fit one page width,        */
+894            /*   matching the layout of the ETL Pipeline report                                      */
+895            OPTIONS LEFTMARGIN=0.5IN RIGHTMARGIN=0.5IN;
+896        
+897            PROC PRINT DATA=FNMAE.RunLog NOOBS LABEL
+898                       STYLE(HEADER)=[FONTSIZE=7PT]
+899                       STYLE(DATA)  =[FONTSIZE=7PT];
+900            RUN;
+901        
+902            OPTIONS LEFTMARGIN=1IN RIGHTMARGIN=1IN;
+903        
+904            TITLE1 "ETL Pipeline: Grand Totals";
+905            PROC SQL;
+906                SELECT count(*)                        LABEL="Data sets processed",
+907                       sum(RawRows)                    LABEL="Total monthly records"      FORMAT=COMMA18.,
+908                       sum(LoanRows)                   LABEL="Total loans"               FORMAT=COMMA14.,
+909                       sum(Defaults)                    LABEL="Total defaults"            FORMAT=COMMA12.,
+910                       sum(ProcessTime)                LABEL="Total SAS processing time"  FORMAT=TIME12.,
+911                       sum(RawRows) / sum(ProcessTime) LABEL="Records per second"         FORMAT=COMMA12.
+912                FROM FNMAE.RunLog;
+913            QUIT;
+914        
+915            TITLE2 "Monthly records read by acquisition quarter";
+916            PROC SGPLOT DATA=FNMAE.RunLog;
+917                VBAR Quarter / RESPONSE=RawRows STAT=SUM FILLATTRS=(COLOR=CX1F4E79);
+918                YAXIS LABEL="Monthly records" GRID;
+919                XAXIS LABEL="Acquisition quarter" FITPOLICY=THIN;
+920            RUN;
+921        
+922            TITLE;
+923            ODS PDF CLOSE;
+924            ODS GRAPHICS OFF;
+925        
+926        %MEND Generate_Pdf;
+927        
+34                                                         The SAS System                      Thursday, August  6, 2026 04:08:39 PM
+
+928        %Generate_Pdf;
+NOTE: STYLE 'ScorecardStyle' has been saved to: WORK.TEMPLAT
+NOTE: PROCEDURE TEMPLATE used (Total process time):
+      real time           0.00 seconds
+      user cpu time       0.00 seconds
+      system cpu time     0.00 seconds
+      memory              168.28k
+      OS Memory           33444.00k
+      Timestamp           08/06/2026 11:08:39 PM
+      Step Count                        86  Switch Count  2
+      Page Faults                       0
+      Page Reclaims                     20
+      Page Swaps                        0
+      Voluntary Context Switches        9
+      Involuntary Context Switches      0
+      Block Input Operations            0
+      Block Output Operations           128
+      
+
+NOTE: Writing ODS PDF output to DISK destination "/home/bvsierrap0/CreditRiskScorecard_Report.pdf", printer "PDF".
+NOTE: PROCEDURE ODSTEXT used (Total process time):
+      real time           0.00 seconds
+      user cpu time       0.00 seconds
+      system cpu time     0.00 seconds
+      memory              111.18k
+      OS Memory           26288.00k
+      Timestamp           08/06/2026 11:08:39 PM
+      Step Count                        87  Switch Count  0
+      Page Faults                       0
+      Page Reclaims                     41
+      Page Swaps                        0
+      Voluntary Context Switches        4
+      Involuntary Context Switches      0
+      Block Input Operations            0
+      Block Output Operations           128
+      
+
+NOTE: PROCEDURE ODSTEXT used (Total process time):
+      real time           0.02 seconds
+      user cpu time       0.02 seconds
+      system cpu time     0.01 seconds
+      memory              2949.06k
+      OS Memory           26600.00k
+      Timestamp           08/06/2026 11:08:39 PM
+      Step Count                        88  Switch Count  0
+      Page Faults                       0
+      Page Reclaims                     182
+      Page Swaps                        0
+      Voluntary Context Switches        9
+      Involuntary Context Switches      0
+      Block Input Operations            0
+      Block Output Operations           96
+      
+
+NOTE: PROCEDURE ODSTEXT used (Total process time):
+      real time           0.00 seconds
+      user cpu time       0.00 seconds
+      system cpu time     0.00 seconds
+                                                           The SAS System
+
+      memory              102.18k
+      OS Memory           26600.00k
+      Timestamp           08/06/2026 11:08:39 PM
+      Step Count                        89  Switch Count  0
+      Page Faults                       0
+      Page Reclaims                     27
+      Page Swaps                        0
+      Voluntary Context Switches        0
+      Involuntary Context Switches      0
+      Block Input Operations            0
+      Block Output Operations           0
+      
+
+NOTE: PROCEDURE ODSTEXT used (Total process time):
+      real time           0.00 seconds
+      user cpu time       0.00 seconds
+      system cpu time     0.00 seconds
+      memory              319.15k
+      OS Memory           26600.00k
+      Timestamp           08/06/2026 11:08:39 PM
+      Step Count                        90  Switch Count  0
+      Page Faults                       0
+      Page Reclaims                     18
+      Page Swaps                        0
+      Voluntary Context Switches        0
+      Involuntary Context Switches      0
+      Block Input Operations            0
+      Block Output Operations           0
+      
+
+NOTE: PROCEDURE ODSTEXT used (Total process time):
+      real time           0.00 seconds
+      user cpu time       0.00 seconds
+      system cpu time     0.00 seconds
+      memory              295.56k
+      OS Memory           26600.00k
+      Timestamp           08/06/2026 11:08:39 PM
+      Step Count                        91  Switch Count  0
+      Page Faults                       0
+      Page Reclaims                     16
+      Page Swaps                        0
+      Voluntary Context Switches        0
+      Involuntary Context Switches      0
+      Block Input Operations            0
+      Block Output Operations           0
+      
+
+NOTE: PROCEDURE SQL used (Total process time):
+      real time           2.98 seconds
+      user cpu time       5.65 seconds
+      system cpu time     0.65 seconds
+      memory              771990.42k
+      OS Memory           796000.00k
+      Timestamp           08/06/2026 11:08:42 PM
+      Step Count                        92  Switch Count  5
+      Page Faults                       0
+      Page Reclaims                     182702
+      Page Swaps                        0
+                                                           The SAS System
+
+      Voluntary Context Switches        14201
+      Involuntary Context Switches      15
+      Block Input Operations            0
+      Block Output Operations           0
+      
+
+
+NOTE: There were 19144733 observations read from the data set MODEL.MODELBASE.
+NOTE: The data set WORK._YEARRATE has 9 observations and 2 variables.
+NOTE: PROCEDURE MEANS used (Total process time):
+      real time           0.61 seconds
+      user cpu time       1.58 seconds
+      system cpu time     0.25 seconds
+      memory              10503.50k
+      OS Memory           36868.00k
+      Timestamp           08/06/2026 11:08:42 PM
+      Step Count                        93  Switch Count  3
+      Page Faults                       0
+      Page Reclaims                     2498
+      Page Swaps                        0
+      Voluntary Context Switches        3283
+      Involuntary Context Switches      8
+      Block Input Operations            0
+      Block Output Operations           264
+      
+
+
+NOTE: Since no format is assigned, the numeric category variable will use the default of BEST6.
+NOTE: STATGRAPH 'SGPlot' has been saved to: WORK.___Graph___
+NOTE: PROCEDURE SGPLOT used (Total process time):
+      real time           0.16 seconds
+      user cpu time       0.05 seconds
+      system cpu time     0.00 seconds
+      memory              11817.40k
+      OS Memory           37148.00k
+      Timestamp           08/06/2026 11:08:43 PM
+      Step Count                        94  Switch Count  2
+      Page Faults                       0
+      Page Reclaims                     3181
+      Page Swaps                        0
+      Voluntary Context Switches        143
+      Involuntary Context Switches      3
+      Block Input Operations            0
+      Block Output Operations           496
+      
+NOTE: There were 9 observations read from the data set WORK._YEARRATE.
+
+NOTE: PROCEDURE ODSTEXT used (Total process time):
+      real time           0.00 seconds
+      user cpu time       0.01 seconds
+      system cpu time     0.00 seconds
+      memory              118.87k
+      OS Memory           32488.00k
+      Timestamp           08/06/2026 11:08:43 PM
+      Step Count                        95  Switch Count  0
+      Page Faults                       0
+      Page Reclaims                     20
+      Page Swaps                        0
+                                                           The SAS System
+
+      Voluntary Context Switches        0
+      Involuntary Context Switches      0
+      Block Input Operations            0
+      Block Output Operations           0
+      
+
+
+NOTE: Since no format is assigned, the numeric category variable will use the default of BEST6.
+NOTE: STATGRAPH 'SGPlot' has been saved to: WORK.___Graph___
+NOTE: PROCEDURE SGPLOT used (Total process time):
+      real time           0.12 seconds
+      user cpu time       0.05 seconds
+      system cpu time     0.01 seconds
+      memory              5649.65k
+      OS Memory           37148.00k
+      Timestamp           08/06/2026 11:08:43 PM
+      Step Count                        96  Switch Count  2
+      Page Faults                       0
+      Page Reclaims                     1930
+      Page Swaps                        0
+      Voluntary Context Switches        140
+      Involuntary Context Switches      4
+      Block Input Operations            0
+      Block Output Operations           400
+      
+NOTE: There were 20 observations read from the data set SCORE.FICOBINS.
+
+
+NOTE: There were 20 observations read from the data set SCORE.FICOBINS.
+NOTE: PROCEDURE PRINT used (Total process time):
+      real time           0.00 seconds
+      user cpu time       0.01 seconds
+      system cpu time     0.00 seconds
+      memory              623.65k
+      OS Memory           32748.00k
+      Timestamp           08/06/2026 11:08:43 PM
+      Step Count                        97  Switch Count  0
+      Page Faults                       0
+      Page Reclaims                     53
+      Page Swaps                        0
+      Voluntary Context Switches        5
+      Involuntary Context Switches      0
+      Block Input Operations            0
+      Block Output Operations           8
+      
+
+NOTE: PROCEDURE ODSTEXT used (Total process time):
+      real time           0.00 seconds
+      user cpu time       0.00 seconds
+      system cpu time     0.01 seconds
+      memory              102.84k
+      OS Memory           32488.00k
+      Timestamp           08/06/2026 11:08:43 PM
+      Step Count                        98  Switch Count  0
+      Page Faults                       0
+      Page Reclaims                     16
+      Page Swaps                        0
+      Voluntary Context Switches        0
+                                                           The SAS System
+
+      Involuntary Context Switches      0
+      Block Input Operations            0
+      Block Output Operations           0
+      
+
+
+NOTE: There were 25 observations read from the data set SCORE.POINTS.
+NOTE: PROCEDURE PRINT used (Total process time):
+      real time           0.00 seconds
+      user cpu time       0.00 seconds
+      system cpu time     0.00 seconds
+      memory              603.28k
+      OS Memory           32748.00k
+      Timestamp           08/06/2026 11:08:43 PM
+      Step Count                        99  Switch Count  0
+      Page Faults                       0
+      Page Reclaims                     54
+      Page Swaps                        0
+      Voluntary Context Switches        5
+      Involuntary Context Switches      0
+      Block Input Operations            0
+      Block Output Operations           0
+      
+
+NOTE: PROCEDURE ODSTEXT used (Total process time):
+      real time           0.00 seconds
+      user cpu time       0.00 seconds
+      system cpu time     0.00 seconds
+      memory              290.53k
+      OS Memory           32488.00k
+      Timestamp           08/06/2026 11:08:43 PM
+      Step Count                        100  Switch Count  0
+      Page Faults                       0
+      Page Reclaims                     16
+      Page Swaps                        0
+      Voluntary Context Switches        0
+      Involuntary Context Switches      1
+      Block Input Operations            0
+      Block Output Operations           8
+      
+
+
+NOTE: There were 2 observations read from the data set REPORT.KSSUMMARY.
+NOTE: PROCEDURE PRINT used (Total process time):
+      real time           0.00 seconds
+      user cpu time       0.00 seconds
+      system cpu time     0.00 seconds
+      memory              448.15k
+      OS Memory           32748.00k
+      Timestamp           08/06/2026 11:08:43 PM
+      Step Count                        101  Switch Count  0
+      Page Faults                       0
+      Page Reclaims                     58
+      Page Swaps                        0
+      Voluntary Context Switches        5
+      Involuntary Context Switches      1
+      Block Input Operations            0
+      Block Output Operations           0
+                                                           The SAS System
+
+      
+
+
+NOTE: STATGRAPH 'SGPlot' has been saved to: WORK.___Graph___
+NOTE: PROCEDURE SGPLOT used (Total process time):
+      real time           0.13 seconds
+      user cpu time       0.06 seconds
+      system cpu time     0.00 seconds
+      memory              5479.62k
+      OS Memory           37148.00k
+      Timestamp           08/06/2026 11:08:43 PM
+      Step Count                        102  Switch Count  7
+      Page Faults                       0
+      Page Reclaims                     1721
+      Page Swaps                        0
+      Voluntary Context Switches        155
+      Involuntary Context Switches      2
+      Block Input Operations            0
+      Block Output Operations           448
+      
+NOTE: There were 693 observations read from the data set REPORT.ROCVALID.
+
+NOTE: PROCEDURE ODSTEXT used (Total process time):
+      real time           0.00 seconds
+      user cpu time       0.00 seconds
+      system cpu time     0.00 seconds
+      memory              295.87k
+      OS Memory           32488.00k
+      Timestamp           08/06/2026 11:08:43 PM
+      Step Count                        103  Switch Count  0
+      Page Faults                       0
+      Page Reclaims                     16
+      Page Swaps                        0
+      Voluntary Context Switches        0
+      Involuntary Context Switches      0
+      Block Input Operations            0
+      Block Output Operations           0
+      
+
+
+NOTE: There were 10 observations read from the data set REPORT.CALIBRATIONBYBAND.
+NOTE: PROCEDURE PRINT used (Total process time):
+      real time           0.00 seconds
+      user cpu time       0.01 seconds
+      system cpu time     0.00 seconds
+      memory              601.65k
+      OS Memory           32748.00k
+      Timestamp           08/06/2026 11:08:43 PM
+      Step Count                        104  Switch Count  0
+      Page Faults                       0
+      Page Reclaims                     58
+      Page Swaps                        0
+      Voluntary Context Switches        5
+      Involuntary Context Switches      0
+      Block Input Operations            0
+      Block Output Operations           0
+      
+
+                                                           The SAS System
+
+
+NOTE: There were 2 observations read from the data set REPORT.CALIBRATIONBYYEAR.
+NOTE: PROCEDURE PRINT used (Total process time):
+      real time           0.00 seconds
+      user cpu time       0.00 seconds
+      system cpu time     0.00 seconds
+      memory              601.68k
+      OS Memory           32748.00k
+      Timestamp           08/06/2026 11:08:43 PM
+      Step Count                        105  Switch Count  0
+      Page Faults                       0
+      Page Reclaims                     58
+      Page Swaps                        0
+      Voluntary Context Switches        5
+      Involuntary Context Switches      0
+      Block Input Operations            0
+      Block Output Operations           0
+      
+
+NOTE: PROCEDURE ODSTEXT used (Total process time):
+      real time           0.00 seconds
+      user cpu time       0.01 seconds
+      system cpu time     0.00 seconds
+      memory              312.12k
+      OS Memory           32488.00k
+      Timestamp           08/06/2026 11:08:43 PM
+      Step Count                        106  Switch Count  0
+      Page Faults                       0
+      Page Reclaims                     16
+      Page Swaps                        0
+      Voluntary Context Switches        0
+      Involuntary Context Switches      1
+      Block Input Operations            0
+      Block Output Operations           8
+      
+
+
+NOTE: There were 10 observations read from the data set REPORT.PSI.
+NOTE: PROCEDURE PRINT used (Total process time):
+      real time           0.00 seconds
+      user cpu time       0.00 seconds
+      system cpu time     0.00 seconds
+      memory              640.09k
+      OS Memory           32748.00k
+      Timestamp           08/06/2026 11:08:43 PM
+      Step Count                        107  Switch Count  0
+      Page Faults                       0
+      Page Reclaims                     61
+      Page Swaps                        0
+      Voluntary Context Switches        5
+      Involuntary Context Switches      0
+      Block Input Operations            0
+      Block Output Operations           0
+      
+
+NOTE: There were 48 observations read from the data set FNMAE.RUNLOG.
+NOTE: PROCEDURE PRINT used (Total process time):
+      real time           0.02 seconds
+                                                           The SAS System
+
+      user cpu time       0.02 seconds
+      system cpu time     0.00 seconds
+      memory              1172.81k
+      OS Memory           32748.00k
+      Timestamp           08/06/2026 11:08:43 PM
+      Step Count                        108  Switch Count  1
+      Page Faults                       0
+      Page Reclaims                     101
+      Page Swaps                        0
+      Voluntary Context Switches        10
+      Involuntary Context Switches      1
+      Block Input Operations            0
+      Block Output Operations           16
+      
+
+NOTE: PROCEDURE SQL used (Total process time):
+      real time           0.00 seconds
+      user cpu time       0.01 seconds
+      system cpu time     0.01 seconds
+      memory              5641.31k
+      OS Memory           37872.00k
+      Timestamp           08/06/2026 11:08:43 PM
+      Step Count                        109  Switch Count  0
+      Page Faults                       0
+      Page Reclaims                     56
+      Page Swaps                        0
+      Voluntary Context Switches        6
+      Involuntary Context Switches      1
+      Block Input Operations            0
+      Block Output Operations           0
+      
+
+
+NOTE: STATGRAPH 'SGPlot' has been saved to: WORK.___Graph___
+NOTE: PROCEDURE SGPLOT used (Total process time):
+      real time           0.12 seconds
+      user cpu time       0.05 seconds
+      system cpu time     0.00 seconds
+      memory              5428.06k
+      OS Memory           37404.00k
+      Timestamp           08/06/2026 11:08:43 PM
+      Step Count                        110  Switch Count  2
+      Page Faults                       0
+      Page Reclaims                     1960
+      Page Swaps                        0
+      Voluntary Context Switches        240
+      Involuntary Context Switches      5
+      Block Input Operations            0
+      Block Output Operations           448
+      
+NOTE: Some of the tick values have been thinned.
+NOTE: There were 48 observations read from the data set FNMAE.RUNLOG.
+
+NOTE: ODS PDF printed 11 pages to /home/bvsierrap0/CreditRiskScorecard_Report.pdf.
+929        
+930        
+931        /**************************************************************************************************/
+932        /*                                                                                                */
+                                                           The SAS System
+
+933        /*   Generate_WebReport macro produces the same report as one self-contained HTML page            */
+934        /*   Charts embed as inline SVG so index.html needs no supporting files                           */
+935        /*   Download index.html, commit it to the docs folder, and publish through GitHub Pages          */
+936        /*                                                                                                */
+937        /**************************************************************************************************/
+938        
+939        %MACRO Generate_WebReport;
+940        
+941            /*   The same report as one self-contained HTML page - same style, same cover, same       */
+942            /*   commentary and the same sections as the PDF                                          */
+943            PROC TEMPLATE;
+944                DEFINE STYLE ScorecardWeb;
+945                    PARENT = Styles.Pearl;
+946                    CLASS Fonts /
+947                        'TitleFont'    = ("Helvetica", 13PT, BOLD)
+948                        'HeadingFont'  = ("Helvetica", 10PT, BOLD)
+949                        'DocFont'      = ("Helvetica", 10PT);
+950                    CLASS Header       / BACKGROUNDCOLOR=CX1F4E79 COLOR=WHITE;
+951                    CLASS SystemTitle  / COLOR=CX1F4E79 FONTSIZE=13PT;
+952                    CLASS SystemTitle2 / COLOR=CX1F4E79 FONTSIZE=12PT FONTWEIGHT=MEDIUM;
+953                END;
+954            RUN;
+955        
+956            OPTIONS NODATE NONUMBER;
+957            ODS _ALL_ CLOSE;
+958            ODS GRAPHICS ON / WIDTH=6.4IN HEIGHT=2.6IN OUTPUTFMT=SVG;
+959            ODS ESCAPECHAR='^';
+960        
+961            ODS HTML5 FILE="&root/index.html" STYLE=ScorecardWeb
+962                      OPTIONS(SVG_MODE="INLINE") GTITLE GFOOTNOTE;
+963        
+964            /*   Cover   */
+965            PROC ODSTEXT;
+966                P " " / STYLE=[FONTSIZE=5PT];
+967                P " " / STYLE=[FONTSIZE=5PT];
+968            RUN;
+969        
+970            PROC ODSTEXT;
+971                P "Credit Risk Scorecard"
+972                  / STYLE=[FONTSIZE=22PT FONTWEIGHT=BOLD COLOR=CX1F4E79 JUST=CENTER];
+973                P "Out-of-Time Validation Through the 2008 Crisis"
+974                  / STYLE=[FONTSIZE=13PT FONTWEIGHT=BOLD COLOR=CX1F4E79 JUST=CENTER];
+975                P "Trained on 2000-2005 loans"
+976                  / STYLE=[FONTSIZE=12PT COLOR=CX1F4E79 JUST=CENTER];
+977                P "Tested on 2006-2007 loans"
+978                  / STYLE=[FONTSIZE=12PT COLOR=CX1F4E79 JUST=CENTER];
+979                P " " / STYLE=[FONTSIZE=5PT];
+980                P " " / STYLE=[FONTSIZE=5PT];
+981                P "Fannie Mae Single-Family Loan Performance Data"
+982                  / STYLE=[FONTSIZE=12PT COLOR=CX1F4E79 JUST=CENTER];
+983                P "Anne M. Prihoda"
+984                  / STYLE=[FONTSIZE=12PT COLOR=CX1F4E79 JUST=CENTER];
+985                P " " / STYLE=[FONTSIZE=5PT];
+986                P " " / STYLE=[FONTSIZE=5PT];
+987                P " " / STYLE=[FONTSIZE=5PT];
+988                P "What this report covers"
+989                  / STYLE=[FONTSIZE=12PT FONTWEIGHT=BOLD COLOR=CX1F4E79];
+990                P " " / STYLE=[FONTSIZE=5PT];
+                                                           The SAS System
+
+991                P "^{unicode 2022}  Builds a loan-level credit risk scorecard on 2000 to 2005 mortgage originations using
+991      ! predictor binning, Weight of Evidence, logistic regression, and points scaling"
+992                  / STYLE=[FONTSIZE=10PT];
+993                P " " / STYLE=[FONTSIZE=5PT];
+994                P "^{unicode 2022}  Validates the scorecard out-of-time on 2006 to 2007 originations, which seasoned through the
+994      ! housing crisis"
+995                  / STYLE=[FONTSIZE=10PT];
+996                P " " / STYLE=[FONTSIZE=5PT];
+997                P "^{unicode 2022}  Weight of Evidence (WOE) converts each predictor onto a common risk scale by comparing,
+997      ! within each range of values, the share of loans that repaid against the share that defaulted. Information Value (IV) sums
+997      !  that separation across all ranges into a single number measuring how much a predictor is worth"
+NOTE: The quoted string currently being processed has become more than 262 bytes long.  You might have unbalanced quotation marks.
+998                  / STYLE=[FONTSIZE=10PT];
+999                P " " / STYLE=[FONTSIZE=5PT];
+1000               P "^{unicode 2022}  Discrimination is measured by the Kolmogorov-Smirnov statistic (KS), the widest gap between
+1000     ! defaults captured and non-defaults captured, and by the ROC curve and the area beneath it (AUC)"
+1001                 / STYLE=[FONTSIZE=10PT];
+1002               P " " / STYLE=[FONTSIZE=5PT];
+1003               P "^{unicode 2022}  Calibration asks whether the predicted level of default is right, comparing predicted against
+1003     !  actual by score band and by origination year. A model can rank loans correctly and still badly understate how many will
+1003     ! default"
+1004                 / STYLE=[FONTSIZE=10PT];
+1005               P " " / STYLE=[FONTSIZE=5PT];
+1006               P "^{unicode 2022}  Population stability asks whether the applicants being scored still resemble those the model
+1006     ! was built on, measured by the Population Stability Index (PSI), the standard early warning in model monitoring"
+1007                 / STYLE=[FONTSIZE=10PT];
+1008               P " " / STYLE=[FONTSIZE=5PT];
+1009               P "^{unicode 2022}  Data prepared by the ETL pipeline: 1,178,508,035 monthly records across 48 quarterly files,
+1009     ! reconciled to Fannie Mae published statistical summaries"
+1010                 / STYLE=[FONTSIZE=10PT];
+1011           RUN;
+1012       
+1013           /*   Contents   */
+1014           PROC ODSTEXT;
+1015               P "Contents"
+1016                 / STYLE=[FONTSIZE=12PT FONTWEIGHT=BOLD COLOR=CX1F4E79];
+1017               P " " / STYLE=[FONTSIZE=5PT];
+1018               P "1.  Portfolio Composition and Observed Default"
+1019                 / STYLE=[FONTSIZE=12PT COLOR=CX1F4E79];
+1020               P "2.  Credit Score Risk Profile"
+1021                 / STYLE=[FONTSIZE=12PT COLOR=CX1F4E79];
+1022               P "3.  The Scorecard"
+1023                 / STYLE=[FONTSIZE=12PT COLOR=CX1F4E79];
+1024               P "4.  Model Discrimination"
+1025                 / STYLE=[FONTSIZE=12PT COLOR=CX1F4E79];
+1026               P "5.  Calibration - Predicted versus Actual"
+1027                 / STYLE=[FONTSIZE=12PT COLOR=CX1F4E79];
+1028               P "6.  Population Stability"
+1029                 / STYLE=[FONTSIZE=12PT COLOR=CX1F4E79];
+1030               P "Appendix.  Data Processing Record"
+1031                 / STYLE=[FONTSIZE=12PT COLOR=CX1F4E79];
+1032               P " " / STYLE=[FONTSIZE=5PT];
+1033           RUN;
+1034       
+1035           /*   Section 1 - portfolio   */
+1036           TITLE1 "1.  Portfolio Composition and Observed Default";
+1037           TITLE2;
+1038           PROC ODSTEXT;
+                                                           The SAS System
+
+1039               P "^{unicode 2022}  19.1 million prime, fully documented, fixed-rate mortgages acquired by Fannie Mae between
+1039     ! 2000 and 2007"
+1040                 / STYLE=[FONTSIZE=10PT];
+1041               P "^{unicode 2022}  Loan counts and default rates reconcile to Fannie Mae published summaries within a few basis
+1041     ! points on every vintage"
+1042                 / STYLE=[FONTSIZE=10PT];
+1043               P "^{unicode 2022}  Default rates hold between 1.2 and 1.6 percent for loans made from 2000 through 2003"
+1044                 / STYLE=[FONTSIZE=10PT];
+1045               P "^{unicode 2022}  They then climb steeply: 3.2 percent in 2004, 6.0 percent in 2005, and 8 to 9 percent in 2006
+1045     !  and 2007"
+1046                 / STYLE=[FONTSIZE=10PT];
+1047               P "^{unicode 2022}  That is a sevenfold deterioration inside the safest segment of the mortgage market"
+1048                 / STYLE=[FONTSIZE=10PT];
+1049               P "^{unicode 2022}  It happened with no comparable movement in the characteristics lenders were underwriting on"
+1050                 / STYLE=[FONTSIZE=10PT];
+1051           RUN;
+1052       
+1053           PROC SQL;
+1054               SELECT OrigYear          LABEL="Origination year",
+1055                      count(*)           AS Loans    FORMAT=COMMA12. LABEL="Loans",
+1056                      sum(DefaultFlag)   AS Defaults FORMAT=COMMA12. LABEL="Defaults",
+1057                      mean(DefaultFlag)  AS DefRate  FORMAT=PERCENT8.2 LABEL="Default rate"
+1058               FROM MODEL.ModelBase
+1059               GROUP BY OrigYear;
+1060           QUIT;
+1061       
+1062           /*   Summarize before plotting - SGPLOT cannot render 19 million rows directly   */
+1063           PROC MEANS DATA=MODEL.ModelBase NOPRINT NWAY;
+1064               CLASS OrigYear;
+1065               VAR DefaultFlag;
+1066               OUTPUT OUT=WORK._YearRate (DROP=_TYPE_ _FREQ_) MEAN=DefRate;
+1067           RUN;
+1068       
+1069           TITLE2 "Observed default rate by origination year";
+1070           PROC SGPLOT DATA=WORK._YearRate;
+1071               VBAR OrigYear / RESPONSE=DefRate FILLATTRS=(COLOR=CX1F4E79);
+1072               YAXIS LABEL="Default rate" VALUESFORMAT=PERCENT8.1 GRID;
+1073               XAXIS LABEL="Origination year";
+1074           RUN;
+1075       
+1076           /*   Section 2 - risk profile   */
+1077           TITLE1 "2.  Credit Score Risk Profile";
+1078           TITLE2 "Weight of Evidence by fine bin, training sample";
+1079           PROC ODSTEXT;
+1080               P "^{unicode 2022}  Each bar is one twentieth of the training population, weakest credit scores on the left,
+1080     ! strongest on the right"
+1081                 / STYLE=[FONTSIZE=10PT];
+1082               P "^{unicode 2022}  Weight of Evidence compares a bin's share of loans that repaid with its share that defaulted"
+1083                 / STYLE=[FONTSIZE=10PT];
+1084               P "^{unicode 2022}  Bars below zero hold more than their share of defaults; bars above zero hold fewer"
+1085                 / STYLE=[FONTSIZE=10PT];
+1086               P "^{unicode 2022}  The climb from minus 0.90 to plus 1.38 is steady and almost perfectly ordered"
+1087                 / STYLE=[FONTSIZE=10PT];
+1088               P "^{unicode 2022}  Information Value of 0.53 on 16.8 million loans, the strongest characteristic tested"
+1089                 / STYLE=[FONTSIZE=10PT];
+1090           RUN;
+1091       
+1092           PROC SGPLOT DATA=SCORE.FicoBins;
+                                                           The SAS System
+
+1093               VBAR RFico / RESPONSE=Woe FILLATTRS=(COLOR=CX1F4E79);
+1094               YAXIS LABEL="Weight of Evidence" GRID;
+1095               XAXIS LABEL="Credit score bin, 0 is highest risk";
+1096           RUN;
+1097       
+1098           PROC PRINT DATA=SCORE.FicoBins NOOBS LABEL;
+1099               VAR RFico RawMin RawMax NLoans NBad Woe;
+1100               LABEL RFico="Bin" RawMin="From" RawMax="To" NLoans="Loans"
+1101                     NBad="Defaults" Woe="WOE";
+1102           RUN;
+1103       
+1104           /*   Section 3 - the scorecard   */
+1105           TITLE1 "3.  The Scorecard";
+1106           TITLE2 "Points by characteristic and class";
+1107           PROC ODSTEXT;
+1108               P "^{unicode 2022}  Add the points for each of the three characteristics to obtain the loan score"
+1109                 / STYLE=[FONTSIZE=10PT];
+1110               P "^{unicode 2022}  Higher points mean lower risk"
+1111                 / STYLE=[FONTSIZE=10PT];
+1112               P "^{unicode 2022}  600 points corresponds to 50 to 1 odds of repayment"
+1113                 / STYLE=[FONTSIZE=10PT];
+1114               P "^{unicode 2022}  Every 20 additional points doubles those odds"
+1115                 / STYLE=[FONTSIZE=10PT];
+1116           RUN;
+1117       
+1118           PROC PRINT DATA=SCORE.Points NOOBS LABEL;
+1119               VAR Characteristic Bin Woe Points;
+1120           RUN;
+1121       
+1122           /*   Section 4 - discrimination   */
+1123           TITLE1 "4.  Model Discrimination";
+1124           TITLE2 "Out-of-time validation";
+1125           PROC ODSTEXT;
+1126               P "^{unicode 2022}  Discrimination asks whether the model puts riskier loans ahead of safer ones"
+1127                 / STYLE=[FONTSIZE=10PT];
+1128               P "^{unicode 2022}  KS is the widest gap between defaults captured and non-defaults captured, working from worst
+1128     ! score to best"
+1129                 / STYLE=[FONTSIZE=10PT];
+1130               P "^{unicode 2022}  The ROC curve shows the same separation: The further it bows above the diagonal, the better
+1130     ! the ranking"
+1131                 / STYLE=[FONTSIZE=10PT];
+1132               P "^{unicode 2022}  The model was fitted on 2000 to 2005 loans and applied untouched to 2006 and 2007 loans it
+1132     ! had never seen"
+1133                 / STYLE=[FONTSIZE=10PT];
+1134               P "^{unicode 2022}  KS falls only from 37.3 to 32.1, and area under the curve from 0.746 to 0.716"
+1135                 / STYLE=[FONTSIZE=10PT];
+1136               P "^{unicode 2022}  The ranking held: Riskier loans still scored worse and safer loans still scored better, on
+1136     ! loans originated after the training period"
+1137                 / STYLE=[FONTSIZE=10PT];
+1138               P "^{unicode 2022}  Ranking correctly is not the same as predicting correctly: Section 5 shows the predicted
+1138     ! level of default was far too low"
+1139                 / STYLE=[FONTSIZE=10PT];
+1140           RUN;
+1141       
+1142           PROC PRINT DATA=REPORT.KsSummary NOOBS LABEL;
+1143           RUN;
+1144       
+1145           TITLE2 "ROC curve - validation sample";
+                                                           The SAS System
+
+1146           PROC SGPLOT DATA=REPORT.RocValid ASPECT=1;
+1147               SERIES X=_1MSPEC_ Y=_SENSIT_ / LINEATTRS=(COLOR=CX1F4E79 THICKNESS=2);
+1148               LINEPARM X=0 Y=0 SLOPE=1 / LINEATTRS=(PATTERN=SHORTDASH COLOR=GRAY);
+1149               XAXIS LABEL="False positive rate" GRID;
+1150               YAXIS LABEL="True positive rate" GRID;
+1151           RUN;
+1152       
+1153           /*   Section 5 - calibration   */
+1154           TITLE1 "5.  Calibration - Predicted versus Actual";
+1155           TITLE2 "By score decile";
+1156           PROC ODSTEXT;
+1157               P "^{unicode 2022}  Discrimination asks whether the ordering is right; Calibration asks whether the predicted
+1157     ! level is right"
+1158                 / STYLE=[FONTSIZE=10PT];
+1159               P "^{unicode 2022}  A model can rank every loan correctly and still be badly wrong about how many will default"
+1160                 / STYLE=[FONTSIZE=10PT];
+1161               P "^{unicode 2022}  Ordering is flawless: Predicted default rises from 0.19 to 6.28 percent across deciles,
+1161     ! actual from 0.54 to 19.64 percent"
+1162                 / STYLE=[FONTSIZE=10PT];
+1163               P "^{unicode 2022}  Every decile is in the right place, and every decile is understated by a factor of three to
+1163     ! four"
+1164                 / STYLE=[FONTSIZE=10PT];
+1165               P "^{unicode 2022}  2006 originations: Predicted default rate 2.10 percent, actual default rate 8.17 percent"
+1166                 / STYLE=[FONTSIZE=10PT];
+1167               P "^{unicode 2022}  2007 originations: Predicted default rate 2.26 percent, actual default rate 8.94 percent"
+1168                 / STYLE=[FONTSIZE=10PT];
+1169               P "^{unicode 2022}  The model barely separated the two vintages because the applicants barely differed"
+1170                 / STYLE=[FONTSIZE=10PT];
+1171               P "^{unicode 2022}  The difference was in the environment those loans matured into, which no origination
+1171     ! characteristic can express"
+1172                 / STYLE=[FONTSIZE=10PT];
+1173           RUN;
+1174       
+1175           PROC PRINT DATA=REPORT.CalibrationByBand NOOBS LABEL;
+1176           RUN;
+1177       
+1178           TITLE2 "By origination year";
+1179           PROC PRINT DATA=REPORT.CalibrationByYear NOOBS LABEL;
+1180           RUN;
+1181       
+1182           /*   Section 6 - stability   */
+1183           TITLE1 "6.  Population Stability";
+1184           TITLE2 "Training versus validation score distribution";
+1185           PROC ODSTEXT;
+1186               P "^{unicode 2022}  PSI compares the score distribution of the new population against the population the model
+1186     ! was built on"
+1187                 / STYLE=[FONTSIZE=10PT];
+1188               P "^{unicode 2022}  Below 0.10 is stable and requires no action; 0.10 to 0.25 is a minor shift; Above 0.25 calls
+1188     ! for investigation or a rebuild"
+1189                 / STYLE=[FONTSIZE=10PT];
+1190               P "^{unicode 2022}  The index comes to 0.031, comfortably inside the stable range"
+1191                 / STYLE=[FONTSIZE=10PT];
+1192               P "^{unicode 2022}  Applicants arriving in 2006 and 2007 looked very much like those the model was trained on"
+1193                 / STYLE=[FONTSIZE=10PT];
+1194               P "^{unicode 2022}  A monitoring report built on this measure would have raised no alarm while the book defaulted
+1194     !  at four times the predicted rate"
+1195                 / STYLE=[FONTSIZE=10PT];
+1196               P "^{unicode 2022}  The scorecard method worked: It ranked risk correctly and its inputs stayed stable"
+                                                           The SAS System
+
+1197                 / STYLE=[FONTSIZE=10PT];
+1198               P "^{unicode 2022}  What failed was the assumption that the relationship between borrower characteristics and
+1198     ! default holds steady over time"
+1199                 / STYLE=[FONTSIZE=10PT];
+1200               P "^{unicode 2022}  Population monitoring cannot detect that failure because it watches applicants rather than
+1200     ! outcomes"
+1201                 / STYLE=[FONTSIZE=10PT];
+1202               P "^{unicode 2022}  Actual-versus-predicted tracking, shown in Section 5, is what would have caught it, within
+1202     ! months of the 2006 vintage seasoning"
+1203                 / STYLE=[FONTSIZE=10PT];
+1204           RUN;
+1205       
+1206           PROC PRINT DATA=REPORT.Psi NOOBS LABEL;
+1207               VAR Band CutHigh NTrain NValid PctTrain PctValid PsiPart Psi;
+1208           RUN;
+1209       
+1210           /*   Appendix - the ETL processing record, matching the ETL Pipeline report   */
+1211           TITLE1 "Appendix.  Data Processing Record";
+1212           TITLE2 "ETL Pipeline Processing Record";
+1213           PROC PRINT DATA=FNMAE.RunLog NOOBS LABEL
+1214                      STYLE(HEADER)=[FONTSIZE=8PT]
+1215                      STYLE(DATA)  =[FONTSIZE=8PT];
+1216           RUN;
+1217       
+1218           TITLE1 "ETL Pipeline: Grand Totals";
+1219           PROC SQL;
+1220               SELECT count(*)                        LABEL="Data sets processed",
+1221                      sum(RawRows)                    LABEL="Total monthly records"      FORMAT=COMMA18.,
+1222                      sum(LoanRows)                   LABEL="Total loans"               FORMAT=COMMA14.,
+1223                      sum(Defaults)                    LABEL="Total defaults"            FORMAT=COMMA12.,
+1224                      sum(ProcessTime)                LABEL="Total SAS processing time"  FORMAT=TIME12.,
+1225                      sum(RawRows) / sum(ProcessTime) LABEL="Records per second"         FORMAT=COMMA12.
+1226               FROM FNMAE.RunLog;
+1227           QUIT;
+1228       
+1229           TITLE2 "Monthly records read by acquisition quarter";
+1230           PROC SGPLOT DATA=FNMAE.RunLog;
+1231               VBAR Quarter / RESPONSE=RawRows STAT=SUM FILLATTRS=(COLOR=CX1F4E79);
+1232               YAXIS LABEL="Monthly records" GRID;
+1233               XAXIS LABEL="Acquisition quarter" FITPOLICY=THIN;
+1234           RUN;
+1235       
+1236           TITLE;
+1237           ODS HTML5 CLOSE;
+1238           ODS GRAPHICS OFF;
+1239       
+1240       %MEND Generate_WebReport;
+1241       
+1242       %Generate_WebReport;
+NOTE: STYLE 'ScorecardWeb' has been saved to: WORK.TEMPLAT
+NOTE: PROCEDURE TEMPLATE used (Total process time):
+      real time           0.00 seconds
+      user cpu time       0.00 seconds
+      system cpu time     0.00 seconds
+      memory              119.71k
+      OS Memory           25516.00k
+      Timestamp           08/06/2026 11:08:43 PM
+      Step Count                        111  Switch Count  1
+                                                           The SAS System
+
+      Page Faults                       0
+      Page Reclaims                     14
+      Page Swaps                        0
+      Voluntary Context Switches        2
+      Involuntary Context Switches      0
+      Block Input Operations            0
+      Block Output Operations           0
+      
+
+NOTE: Writing HTML5 Body file: /home/bvsierrap0/index.html
+NOTE: PROCEDURE ODSTEXT used (Total process time):
+      real time           0.00 seconds
+      user cpu time       0.00 seconds
+      system cpu time     0.00 seconds
+      memory              107.50k
+      OS Memory           25764.00k
+      Timestamp           08/06/2026 11:08:43 PM
+      Step Count                        112  Switch Count  0
+      Page Faults                       0
+      Page Reclaims                     16
+      Page Swaps                        0
+      Voluntary Context Switches        0
+      Involuntary Context Switches      0
+      Block Input Operations            0
+      Block Output Operations           0
+      
+
+NOTE: PROCEDURE ODSTEXT used (Total process time):
+      real time           0.00 seconds
+      user cpu time       0.01 seconds
+      system cpu time     0.00 seconds
+      memory              463.00k
+      OS Memory           25764.00k
+      Timestamp           08/06/2026 11:08:43 PM
+      Step Count                        113  Switch Count  0
+      Page Faults                       0
+      Page Reclaims                     17
+      Page Swaps                        0
+      Voluntary Context Switches        0
+      Involuntary Context Switches      0
+      Block Input Operations            0
+      Block Output Operations           0
+      
+
+NOTE: PROCEDURE ODSTEXT used (Total process time):
+      real time           0.00 seconds
+      user cpu time       0.01 seconds
+      system cpu time     0.00 seconds
+      memory              347.37k
+      OS Memory           25764.00k
+      Timestamp           08/06/2026 11:08:43 PM
+      Step Count                        114  Switch Count  0
+      Page Faults                       0
+      Page Reclaims                     16
+      Page Swaps                        0
+      Voluntary Context Switches        0
+      Involuntary Context Switches      0
+      Block Input Operations            0
+                                                           The SAS System
+
+      Block Output Operations           0
+      
+
+NOTE: PROCEDURE ODSTEXT used (Total process time):
+      real time           0.00 seconds
+      user cpu time       0.00 seconds
+      system cpu time     0.00 seconds
+      memory              294.43k
+      OS Memory           25764.00k
+      Timestamp           08/06/2026 11:08:43 PM
+      Step Count                        115  Switch Count  0
+      Page Faults                       0
+      Page Reclaims                     16
+      Page Swaps                        0
+      Voluntary Context Switches        0
+      Involuntary Context Switches      1
+      Block Input Operations            0
+      Block Output Operations           0
+      
+
+NOTE: PROCEDURE SQL used (Total process time):
+      real time           2.96 seconds
+      user cpu time       5.62 seconds
+      system cpu time     0.65 seconds
+      memory              772118.07k
+      OS Memory           795164.00k
+      Timestamp           08/06/2026 11:08:46 PM
+      Step Count                        116  Switch Count  21
+      Page Faults                       0
+      Page Reclaims                     182659
+      Page Swaps                        0
+      Voluntary Context Switches        14250
+      Involuntary Context Switches      29
+      Block Input Operations            0
+      Block Output Operations           0
+      
+
+
+NOTE: There were 19144733 observations read from the data set MODEL.MODELBASE.
+NOTE: The data set WORK._YEARRATE has 9 observations and 2 variables.
+NOTE: PROCEDURE MEANS used (Total process time):
+      real time           0.58 seconds
+      user cpu time       1.48 seconds
+      system cpu time     0.24 seconds
+      memory              10506.12k
+      OS Memory           35008.00k
+      Timestamp           08/06/2026 11:08:47 PM
+      Step Count                        117  Switch Count  2
+      Page Faults                       0
+      Page Reclaims                     2323
+      Page Swaps                        0
+      Voluntary Context Switches        3414
+      Involuntary Context Switches      11
+      Block Input Operations            0
+      Block Output Operations           272
+      
+
+
+                                                           The SAS System
+
+NOTE: Since no format is assigned, the numeric category variable will use the default of BEST6.
+NOTE: STATGRAPH 'SGPlot' has been saved to: WORK.___Graph___
+NOTE: PROCEDURE SGPLOT used (Total process time):
+      real time           0.11 seconds
+      user cpu time       0.04 seconds
+      system cpu time     0.01 seconds
+      memory              9632.03k
+      OS Memory           32428.00k
+      Timestamp           08/06/2026 11:08:47 PM
+      Step Count                        118  Switch Count  2
+      Page Faults                       0
+      Page Reclaims                     1854
+      Page Swaps                        0
+      Voluntary Context Switches        149
+      Involuntary Context Switches      0
+      Block Input Operations            0
+      Block Output Operations           648
+      
+NOTE: There were 9 observations read from the data set WORK._YEARRATE.
+
+NOTE: PROCEDURE ODSTEXT used (Total process time):
+      real time           0.00 seconds
+      user cpu time       0.00 seconds
+      system cpu time     0.00 seconds
+      memory              120.90k
+      OS Memory           31652.00k
+      Timestamp           08/06/2026 11:08:47 PM
+      Step Count                        119  Switch Count  0
+      Page Faults                       0
+      Page Reclaims                     21
+      Page Swaps                        0
+      Voluntary Context Switches        0
+      Involuntary Context Switches      0
+      Block Input Operations            0
+      Block Output Operations           0
+      
+
+
+NOTE: Since no format is assigned, the numeric category variable will use the default of BEST6.
+NOTE: STATGRAPH 'SGPlot' has been saved to: WORK.___Graph___
+NOTE: PROCEDURE SGPLOT used (Total process time):
+      real time           0.10 seconds
+      user cpu time       0.05 seconds
+      system cpu time     0.01 seconds
+      memory              3481.71k
+      OS Memory           32940.00k
+      Timestamp           08/06/2026 11:08:47 PM
+      Step Count                        120  Switch Count  2
+      Page Faults                       0
+      Page Reclaims                     434
+      Page Swaps                        0
+      Voluntary Context Switches        143
+      Involuntary Context Switches      1
+      Block Input Operations            0
+      Block Output Operations           608
+      
+NOTE: There were 20 observations read from the data set SCORE.FICOBINS.
+
+                                                           The SAS System
+
+
+NOTE: There were 20 observations read from the data set SCORE.FICOBINS.
+NOTE: PROCEDURE PRINT used (Total process time):
+      real time           0.02 seconds
+      user cpu time       0.02 seconds
+      system cpu time     0.00 seconds
+      memory              666.09k
+      OS Memory           31912.00k
+      Timestamp           08/06/2026 11:08:47 PM
+      Step Count                        121  Switch Count  0
+      Page Faults                       0
+      Page Reclaims                     61
+      Page Swaps                        0
+      Voluntary Context Switches        5
+      Involuntary Context Switches      2
+      Block Input Operations            0
+      Block Output Operations           16
+      
+
+NOTE: PROCEDURE ODSTEXT used (Total process time):
+      real time           0.00 seconds
+      user cpu time       0.01 seconds
+      system cpu time     0.00 seconds
+      memory              116.71k
+      OS Memory           31652.00k
+      Timestamp           08/06/2026 11:08:47 PM
+      Step Count                        122  Switch Count  0
+      Page Faults                       0
+      Page Reclaims                     16
+      Page Swaps                        0
+      Voluntary Context Switches        0
+      Involuntary Context Switches      0
+      Block Input Operations            0
+      Block Output Operations           0
+      
+
+
+NOTE: There were 25 observations read from the data set SCORE.POINTS.
+NOTE: PROCEDURE PRINT used (Total process time):
+      real time           0.01 seconds
+      user cpu time       0.01 seconds
+      system cpu time     0.00 seconds
+      memory              609.00k
+      OS Memory           31912.00k
+      Timestamp           08/06/2026 11:08:47 PM
+      Step Count                        123  Switch Count  0
+      Page Faults                       0
+      Page Reclaims                     61
+      Page Swaps                        0
+      Voluntary Context Switches        5
+      Involuntary Context Switches      0
+      Block Input Operations            0
+      Block Output Operations           0
+      
+
+NOTE: PROCEDURE ODSTEXT used (Total process time):
+      real time           0.00 seconds
+      user cpu time       0.01 seconds
+                                                           The SAS System
+
+      system cpu time     0.00 seconds
+      memory              299.62k
+      OS Memory           31652.00k
+      Timestamp           08/06/2026 11:08:47 PM
+      Step Count                        124  Switch Count  0
+      Page Faults                       0
+      Page Reclaims                     16
+      Page Swaps                        0
+      Voluntary Context Switches        0
+      Involuntary Context Switches      0
+      Block Input Operations            0
+      Block Output Operations           0
+      
+
+
+NOTE: There were 2 observations read from the data set REPORT.KSSUMMARY.
+NOTE: PROCEDURE PRINT used (Total process time):
+      real time           0.00 seconds
+      user cpu time       0.00 seconds
+      system cpu time     0.00 seconds
+      memory              453.50k
+      OS Memory           31912.00k
+      Timestamp           08/06/2026 11:08:47 PM
+      Step Count                        125  Switch Count  0
+      Page Faults                       0
+      Page Reclaims                     61
+      Page Swaps                        0
+      Voluntary Context Switches        5
+      Involuntary Context Switches      0
+      Block Input Operations            0
+      Block Output Operations           0
+      
+
+
+NOTE: STATGRAPH 'SGPlot' has been saved to: WORK.___Graph___
+NOTE: PROCEDURE SGPLOT used (Total process time):
+      real time           0.10 seconds
+      user cpu time       0.04 seconds
+      system cpu time     0.00 seconds
+      memory              4212.53k
+      OS Memory           33456.00k
+      Timestamp           08/06/2026 11:08:47 PM
+      Step Count                        126  Switch Count  6
+      Page Faults                       0
+      Page Reclaims                     348
+      Page Swaps                        0
+      Voluntary Context Switches        154
+      Involuntary Context Switches      0
+      Block Input Operations            0
+      Block Output Operations           664
+      
+NOTE: There were 693 observations read from the data set REPORT.ROCVALID.
+
+NOTE: PROCEDURE ODSTEXT used (Total process time):
+      real time           0.00 seconds
+      user cpu time       0.00 seconds
+      system cpu time     0.00 seconds
+      memory              318.40k
+                                                           The SAS System
+
+      OS Memory           31652.00k
+      Timestamp           08/06/2026 11:08:47 PM
+      Step Count                        127  Switch Count  0
+      Page Faults                       0
+      Page Reclaims                     16
+      Page Swaps                        0
+      Voluntary Context Switches        0
+      Involuntary Context Switches      0
+      Block Input Operations            0
+      Block Output Operations           0
+      
+
+
+NOTE: There were 10 observations read from the data set REPORT.CALIBRATIONBYBAND.
+NOTE: PROCEDURE PRINT used (Total process time):
+      real time           0.01 seconds
+      user cpu time       0.01 seconds
+      system cpu time     0.00 seconds
+      memory              642.09k
+      OS Memory           31912.00k
+      Timestamp           08/06/2026 11:08:47 PM
+      Step Count                        128  Switch Count  0
+      Page Faults                       0
+      Page Reclaims                     61
+      Page Swaps                        0
+      Voluntary Context Switches        5
+      Involuntary Context Switches      1
+      Block Input Operations            0
+      Block Output Operations           0
+      
+
+
+NOTE: There were 2 observations read from the data set REPORT.CALIBRATIONBYYEAR.
+NOTE: PROCEDURE PRINT used (Total process time):
+      real time           0.00 seconds
+      user cpu time       0.01 seconds
+      system cpu time     0.00 seconds
+      memory              698.18k
+      OS Memory           31912.00k
+      Timestamp           08/06/2026 11:08:47 PM
+      Step Count                        129  Switch Count  0
+      Page Faults                       0
+      Page Reclaims                     61
+      Page Swaps                        0
+      Voluntary Context Switches        5
+      Involuntary Context Switches      0
+      Block Input Operations            0
+      Block Output Operations           0
+      
+
+NOTE: PROCEDURE ODSTEXT used (Total process time):
+      real time           0.00 seconds
+      user cpu time       0.01 seconds
+      system cpu time     0.00 seconds
+      memory              336.06k
+      OS Memory           31652.00k
+      Timestamp           08/06/2026 11:08:47 PM
+      Step Count                        130  Switch Count  0
+                                                           The SAS System
+
+      Page Faults                       0
+      Page Reclaims                     16
+      Page Swaps                        0
+      Voluntary Context Switches        0
+      Involuntary Context Switches      0
+      Block Input Operations            0
+      Block Output Operations           0
+      
+
+
+NOTE: There were 10 observations read from the data set REPORT.PSI.
+NOTE: PROCEDURE PRINT used (Total process time):
+      real time           0.01 seconds
+      user cpu time       0.01 seconds
+      system cpu time     0.00 seconds
+      memory              666.00k
+      OS Memory           31912.00k
+      Timestamp           08/06/2026 11:08:47 PM
+      Step Count                        131  Switch Count  0
+      Page Faults                       0
+      Page Reclaims                     61
+      Page Swaps                        0
+      Voluntary Context Switches        5
+      Involuntary Context Switches      1
+      Block Input Operations            0
+      Block Output Operations           16
+      
+
+NOTE: There were 48 observations read from the data set FNMAE.RUNLOG.
+NOTE: PROCEDURE PRINT used (Total process time):
+      real time           0.05 seconds
+      user cpu time       0.05 seconds
+      system cpu time     0.00 seconds
+      memory              669.46k
+      OS Memory           31912.00k
+      Timestamp           08/06/2026 11:08:47 PM
+      Step Count                        132  Switch Count  1
+      Page Faults                       0
+      Page Reclaims                     61
+      Page Swaps                        0
+      Voluntary Context Switches        8
+      Involuntary Context Switches      3
+      Block Input Operations            0
+      Block Output Operations           48
+      
+
+NOTE: PROCEDURE SQL used (Total process time):
+      real time           0.01 seconds
+      user cpu time       0.01 seconds
+      system cpu time     0.00 seconds
+      memory              5640.96k
+      OS Memory           37036.00k
+      Timestamp           08/06/2026 11:08:47 PM
+      Step Count                        133  Switch Count  0
+      Page Faults                       0
+      Page Reclaims                     55
+      Page Swaps                        0
+      Voluntary Context Switches        6
+                                                           The SAS System
+
+      Involuntary Context Switches      0
+      Block Input Operations            0
+      Block Output Operations           0
+      
+
+
+NOTE: STATGRAPH 'SGPlot' has been saved to: WORK.___Graph___
+NOTE: PROCEDURE SGPLOT used (Total process time):
+      real time           0.09 seconds
+      user cpu time       0.03 seconds
+      system cpu time     0.01 seconds
+      memory              3286.40k
+      OS Memory           32940.00k
+      Timestamp           08/06/2026 11:08:47 PM
+      Step Count                        134  Switch Count  2
+      Page Faults                       0
+      Page Reclaims                     412
+      Page Swaps                        0
+      Voluntary Context Switches        246
+      Involuntary Context Switches      0
+      Block Input Operations            0
+      Block Output Operations           624
+      
+NOTE: Some of the tick values have been thinned.
+NOTE: There were 48 observations read from the data set FNMAE.RUNLOG.
+
+1243       
+1244       /**************************************************************************************************/
+1245       /**************************************************************************************************/
+1246       /**************************************************************************************************/
+1247       
+1248       /**************************************************************************************************/
+1249       /*                                                                                                */
+1250       /*   Optional_Checks_Code macro compartmentalizes various checks that can be run at any time      */
+1251       /*   Check #1 - Model predictors: ranges and missing counts in the model base                     */
+1252       /*   Check #2 - Storage by library and dataset: file sizes against the 5 GB limit                 */
+1253       /*   Check #3 - Row counts: every permanent table in the project libraries                        */
+1254       /*   Check #4 - WORK reset: empties the WORK scratch library. Starred - un-star only after        */
+1255       /*              a failed run                                                                      */
+1256       /*   Run any check at any time to validate successful code execution                              */
+1257       /*                                                                                                */
+1258       /**************************************************************************************************/
+1259       
+1260       %MACRO Optional_Checks_Code;
+1261       
+1262           /*   Check #1 - Model predictors: ranges and missing counts   */
+1263           PROC MEANS DATA=MODEL.ModelBase n nmiss min max mean MAXDEC=1;
+1264               TITLE "Check 1 - Model Predictors: Ranges and Missing Counts";
+1265               VAR FICO LTV CLTV DTI OrigUPB NoteRate;
+1266           RUN;
+1267       
+1268           /*   Check #2 - Storage by library and dataset, largest first   */
+1269           PROC SQL;
+1270               TITLE "Check 2 - Storage by Library and Dataset";
+1271               SELECT Libname  LABEL="Library",
+1272                      Memname  LABEL="Dataset",
+1273                      Filesize FORMAT=SIZEKMG12.1 LABEL="Size of file",
+1274                      Nobs     FORMAT=COMMA14.    LABEL="Rows"
+                                                           The SAS System
+
+1275               FROM DICTIONARY.Tables
+1276               WHERE Libname in ('FNMAE', 'MODEL', 'SCORE', 'REPORT')
+1277               ORDER BY Filesize DESC;
+1278           QUIT;
+1279       
+1280           /*   Check #3 - Row counts for every permanent table   */
+1281           PROC SQL;
+1282               TITLE "Check 3 - Row Counts by Table";
+1283               SELECT Libname   LABEL="Library",
+1284                      Memname   LABEL="Dataset",
+1285                      Nobs      FORMAT=COMMA14. LABEL="Rows"
+1286               FROM DICTIONARY.Tables
+1287               WHERE Libname in ('FNMAE', 'MODEL', 'SCORE', 'REPORT')
+1288               ORDER BY Libname, Memname;
+1289           QUIT;
+1290       
+1291           TITLE;
+1292       
+1293           /*   Check #4 - WORK reset: empties the WORK library. Un-star only after a failed run   */
+1294           *PROC DATASETS LIBRARY=WORK KILL NOLIST;
+1295           *QUIT;
+1296       
+1297       %MEND Optional_Checks_Code;
+1298       
+1299       %Optional_Checks_Code;
+WARNING: No output destinations active.
+NOTE: There were 19144733 observations read from the data set MODEL.MODELBASE.
+NOTE: PROCEDURE MEANS used (Total process time):
+      real time           0.86 seconds
+      user cpu time       2.19 seconds
+      system cpu time     0.26 seconds
+      memory              7595.34k
+      OS Memory           31684.00k
+      Timestamp           08/06/2026 11:08:48 PM
+      Step Count                        135  Switch Count  23
+      Page Faults                       0
+      Page Reclaims                     1580
+      Page Swaps                        0
+      Voluntary Context Switches        5225
+      Involuntary Context Switches      8
+      Block Input Operations            0
+      Block Output Operations           0
+      
+
+WARNING: No output destinations active.
+NOTE: PROCEDURE SQL used (Total process time):
+      real time           0.03 seconds
+      user cpu time       0.01 seconds
+      system cpu time     0.01 seconds
+      memory              13592.95k
+      OS Memory           36800.00k
+      Timestamp           08/06/2026 11:08:48 PM
+      Step Count                        136  Switch Count  1
+      Page Faults                       0
+      Page Reclaims                     2193
+      Page Swaps                        0
+      Voluntary Context Switches        78
+      Involuntary Context Switches      1
+                                                           The SAS System
+
+      Block Input Operations            0
+      Block Output Operations           0
+      
+
+WARNING: No output destinations active.
+NOTE: PROCEDURE SQL used (Total process time):
+      real time           0.02 seconds
+      user cpu time       0.01 seconds
+      system cpu time     0.00 seconds
+      memory              11076.89k
+      OS Memory           34240.00k
+      Timestamp           08/06/2026 11:08:48 PM
+      Step Count                        137  Switch Count  1
+      Page Faults                       0
+      Page Reclaims                     2149
+      Page Swaps                        0
+      Voluntary Context Switches        74
+      Involuntary Context Switches      1
+      Block Input Operations            0
+      Block Output Operations           0
+      
+
+1300       
+1301       OPTIONS NONOTES NOSTIMER NOSOURCE NOSYNTAXCHECK;
